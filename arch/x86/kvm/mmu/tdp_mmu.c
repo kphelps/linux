@@ -7,8 +7,11 @@
 #include "tdp_iter.h"
 #include "tdp_mmu.h"
 #include "spte.h"
+#include "x86.h"
 
 #include <asm/cmpxchg.h>
+#include <asm/mtrr.h>
+#include <asm/vmx.h>
 #include <trace/events/kvm.h>
 
 /* Initializes the TDP MMU for the VM, if enabled. */
@@ -1827,7 +1830,7 @@ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
  * Build a leaf SPTE for user-managed MMU with the specified permissions.
  * This is a simplified version of make_spte() for user-controlled mappings.
  */
-static u64 make_user_spte(struct kvm *kvm, kvm_pfn_t pfn, u32 prot)
+static u64 make_user_spte(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn, u32 prot)
 {
 	u64 spte = SPTE_MMU_PRESENT_MASK;
 
@@ -1862,6 +1865,15 @@ static u64 make_user_spte(struct kvm *kvm, kvm_pfn_t pfn, u32 prot)
 	if (prot & KVM_GPA_MAP_READ)
 		spte |= SPTE_EPT_READABLE_MASK;
 
+	/*
+	 * Default to write-back caching for guest RAM. Without a memory type,
+	 * EPT entries are UC, which tanks guest IPC (observed ~30B cycles for
+	 * only ~47M guest instructions). We don't have a vCPU context here to
+	 * honor guest MTRRs, so always pick WB when EPT memtype bits are in use.
+	 */
+	if (shadow_memtype_mask)
+		spte |= (MTRR_TYPE_WRBACK << VMX_EPT_MT_EPTE_SHIFT) | VMX_EPT_IPAT_BIT;
+
 	return spte;
 }
 
@@ -1891,7 +1903,7 @@ int kvm_tdp_mmu_map_user(struct kvm *kvm, struct kvm_memory_slot *slot,
 	lockdep_assert_held_write(&kvm->mmu_lock);
 
 	/* Build the new SPTE */
-	new_spte = make_user_spte(kvm, pfn, prot);
+	new_spte = make_user_spte(kvm, gfn, pfn, prot);
 
 	for_each_tdp_mmu_root(kvm, root, slot->as_id) {
 		rcu_read_lock();
@@ -1986,7 +1998,7 @@ int kvm_tdp_mmu_protect_user(struct kvm *kvm, struct kvm_memory_slot *slot,
 			pfn = spte_to_pfn(old_spte);
 
 			/* Build new SPTE with updated permissions but same PFN */
-			new_spte = make_user_spte(kvm, pfn, prot);
+			new_spte = make_user_spte(kvm, gfn, pfn, prot);
 
 			/* Preserve accessed/dirty bits from old SPTE */
 			if (is_accessed_spte(old_spte))
