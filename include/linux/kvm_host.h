@@ -597,6 +597,9 @@ struct kvm_memory_slot {
 		pgoff_t pgoff;
 	} gmem;
 #endif
+
+	/* GFN -> struct page* for KVM_MEM_USERMMU slots (page ref tracking) */
+	struct xarray usermmu_pages;
 };
 
 static inline bool kvm_slot_can_be_private(const struct kvm_memory_slot *slot)

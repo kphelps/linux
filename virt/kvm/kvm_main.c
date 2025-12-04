@@ -1028,6 +1028,16 @@ static void kvm_free_memslot(struct kvm *kvm, struct kvm_memory_slot *slot)
 	if (slot->flags & KVM_MEM_GUEST_MEMFD)
 		kvm_gmem_unbind(slot);
 
+	/* Release any pinned pages for user-managed MMU slots */
+	if (slot->flags & KVM_MEM_USERMMU) {
+		struct page *page;
+		unsigned long gfn;
+
+		xa_for_each(&slot->usermmu_pages, gfn, page)
+			put_page(page);
+		xa_destroy(&slot->usermmu_pages);
+	}
+
 	kvm_destroy_dirty_bitmap(slot);
 
 	kvm_arch_free_memslot(kvm, slot);
@@ -2123,6 +2133,8 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	new->npages = npages;
 	new->flags = mem->flags;
 	new->userspace_addr = mem->userspace_addr;
+	if (mem->flags & KVM_MEM_USERMMU)
+		xa_init(&new->usermmu_pages);
 	if (mem->flags & KVM_MEM_GUEST_MEMFD) {
 		r = kvm_gmem_bind(kvm, new, mem->guest_memfd, mem->guest_memfd_offset);
 		if (r)

@@ -540,6 +540,20 @@ struct kvm_gpa_unmap {
 	__u32 pad;
 };
 
+/* for KVM_MAP_GPA_BATCH - batch install user-managed MMU mappings */
+struct kvm_gpa_batch_entry {
+	__u64 gpa;		/* Guest physical address (page-aligned) */
+	__u64 hva;		/* Host virtual address (page-aligned) */
+	__u32 flags;		/* Permission flags: KVM_GPA_MAP_* */
+	__u32 pad;
+};
+
+struct kvm_gpa_batch_mapping {
+	__u32 nmappings;	/* Number of entries */
+	__u32 slot;		/* Memslot ID (must have KVM_MEM_USERMMU) */
+	struct kvm_gpa_batch_entry entries[];
+};
+
 /* for KVM_REGISTER_COALESCED_MMIO / KVM_UNREGISTER_COALESCED_MMIO */
 
 struct kvm_coalesced_mmio_zone {
@@ -1567,6 +1581,7 @@ struct kvm_s390_ucas_mapping {
 #define KVM_MAP_GPA_RANGE         _IOW(KVMIO, 0xd0, struct kvm_gpa_mapping)
 #define KVM_PROTECT_GPA_RANGE     _IOW(KVMIO, 0xd1, struct kvm_gpa_protect)
 #define KVM_UNMAP_GPA_RANGE       _IOW(KVMIO, 0xd2, struct kvm_gpa_unmap)
+#define KVM_MAP_GPA_BATCH         _IOW(KVMIO, 0xd3, struct kvm_gpa_batch_mapping)
 #define KVM_SET_TSC_CONFIG        _IOW(KVMIO, 0xd5, struct kvm_tsc_config)
 #define KVM_GET_TSC_CONFIG        _IOR(KVMIO, 0xd6, struct kvm_tsc_config)
 #define KVM_SET_TSC_MODE          _IOW(KVMIO, 0xd7, struct kvm_tsc_mode_data)

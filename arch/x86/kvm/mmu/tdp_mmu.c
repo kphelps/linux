@@ -1881,7 +1881,7 @@ static u64 make_user_spte(struct kvm *kvm, kvm_pfn_t pfn, u32 prot)
  * Returns 0 on success, negative error code on failure.
  */
 int kvm_tdp_mmu_map_user(struct kvm *kvm, struct kvm_memory_slot *slot,
-			 gfn_t gfn, kvm_pfn_t pfn, u32 prot)
+			 gfn_t gfn, kvm_pfn_t pfn, u32 prot, bool *flush)
 {
 	struct kvm_mmu_page *root;
 	struct tdp_iter iter;
@@ -1936,6 +1936,7 @@ int kvm_tdp_mmu_map_user(struct kvm *kvm, struct kvm_memory_slot *slot,
 			if (iter.level == PG_LEVEL_4K) {
 				/* Found the target level, install the SPTE */
 				tdp_mmu_iter_set_spte(kvm, &iter, new_spte);
+				*flush = true;
 				break;
 			}
 		}
@@ -1946,10 +1947,6 @@ out_rcu:
 		if (ret)
 			break;
 	}
-
-	/* Flush TLB for the affected GFN */
-	if (!ret)
-		kvm_flush_remote_tlbs_gfn(kvm, gfn, PG_LEVEL_4K);
 
 	return ret;
 }
@@ -1968,7 +1965,7 @@ out_rcu:
  * Returns 0 on success, -ENOENT if no mapping exists.
  */
 int kvm_tdp_mmu_protect_user(struct kvm *kvm, struct kvm_memory_slot *slot,
-			     gfn_t gfn, u32 prot)
+			     gfn_t gfn, u32 prot, bool *flush)
 {
 	struct kvm_mmu_page *root;
 	struct tdp_iter iter;
@@ -1998,6 +1995,7 @@ int kvm_tdp_mmu_protect_user(struct kvm *kvm, struct kvm_memory_slot *slot,
 				new_spte |= shadow_dirty_mask;
 
 			tdp_mmu_iter_set_spte(kvm, &iter, new_spte);
+			*flush = true;
 			found = true;
 			break;
 		}
@@ -2007,9 +2005,6 @@ int kvm_tdp_mmu_protect_user(struct kvm *kvm, struct kvm_memory_slot *slot,
 		if (found)
 			break;
 	}
-
-	if (found)
-		kvm_flush_remote_tlbs_gfn(kvm, gfn, PG_LEVEL_4K);
 
 	return found ? 0 : -ENOENT;
 }

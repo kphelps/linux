@@ -7066,6 +7066,7 @@ static int kvm_vm_ioctl_map_gpa_range(struct kvm *kvm,
 	u64 npages, i;
 	int ret = 0;
 	unsigned int gup_flags;
+	bool flush = false;
 
 	/* Validate inputs */
 	if (mapping->size == 0 || mapping->size & (PAGE_SIZE - 1))
@@ -7114,8 +7115,24 @@ static int kvm_vm_ioctl_map_gpa_range(struct kvm *kvm,
 
 	for (i = 0; i < npages; i++) {
 		kvm_pfn_t pfn = page_to_pfn(pages[i]);
+		struct page *old_page;
 
-		ret = kvm_tdp_mmu_map_user(kvm, slot, gfn + i, pfn, mapping->flags);
+		/*
+		 * Yield periodically to avoid holding mmu_lock too long.
+		 * Check every 32 pages (similar to other KVM paths).
+		 * Flush pending TLB entries before yielding.
+		 */
+		if ((i & 31) == 31 &&
+		    (need_resched() || rwlock_needbreak(&kvm->mmu_lock))) {
+			if (flush) {
+				kvm_flush_remote_tlbs_range(kvm, gfn, i + 1);
+				flush = false;
+			}
+			cond_resched_rwlock_write(&kvm->mmu_lock);
+		}
+
+		ret = kvm_tdp_mmu_map_user(kvm, slot, gfn + i, pfn,
+					   mapping->flags, &flush);
 		if (ret) {
 			/* Unpin remaining pages on error */
 			u64 j;
@@ -7123,12 +7140,24 @@ static int kvm_vm_ioctl_map_gpa_range(struct kvm *kvm,
 				put_page(pages[j]);
 			goto out_unlock;
 		}
-		/* Note: page ref is held by the mapping, don't put_page here */
+
+		/*
+		 * Track the pinned page in xarray for later release.
+		 * Handle re-mapping: if GFN was already mapped, release old page.
+		 */
+		old_page = xa_store(&slot->usermmu_pages, gfn + i, pages[i],
+				    GFP_NOWAIT);
+		if (old_page)
+			put_page(old_page);
 	}
 
 	ret = 0;
 
 out_unlock:
+	/* Single TLB flush for all pages mapped in this batch */
+	if (flush)
+		kvm_flush_remote_tlbs_range(kvm, gfn, npages);
+
 	write_unlock(&kvm->mmu_lock);
 out_free:
 	kvfree(pages);
@@ -7142,6 +7171,7 @@ static int kvm_vm_ioctl_protect_gpa_range(struct kvm *kvm,
 	gfn_t gfn;
 	u64 npages, i;
 	int ret = 0;
+	bool flush = false;
 
 	/* Validate inputs */
 	if (protect->size == 0 || protect->size & (PAGE_SIZE - 1))
@@ -7164,10 +7194,29 @@ static int kvm_vm_ioctl_protect_gpa_range(struct kvm *kvm,
 	write_lock(&kvm->mmu_lock);
 
 	for (i = 0; i < npages; i++) {
-		ret = kvm_tdp_mmu_protect_user(kvm, slot, gfn + i, protect->flags);
+		/*
+		 * Yield periodically to avoid holding mmu_lock too long.
+		 * Check every 32 pages (similar to other KVM paths).
+		 * Flush pending TLB entries before yielding.
+		 */
+		if ((i & 31) == 31 &&
+		    (need_resched() || rwlock_needbreak(&kvm->mmu_lock))) {
+			if (flush) {
+				kvm_flush_remote_tlbs_range(kvm, gfn, i + 1);
+				flush = false;
+			}
+			cond_resched_rwlock_write(&kvm->mmu_lock);
+		}
+
+		ret = kvm_tdp_mmu_protect_user(kvm, slot, gfn + i,
+					       protect->flags, &flush);
 		if (ret)
 			break;
 	}
+
+	/* Single TLB flush for all pages protected in this batch */
+	if (flush)
+		kvm_flush_remote_tlbs_range(kvm, gfn, npages);
 
 	write_unlock(&kvm->mmu_lock);
 	return ret;
@@ -7177,7 +7226,7 @@ static int kvm_vm_ioctl_unmap_gpa_range(struct kvm *kvm,
 					struct kvm_gpa_unmap *unmap)
 {
 	struct kvm_memory_slot *slot;
-	gfn_t gfn_start, gfn_end;
+	gfn_t gfn_start, gfn_end, gfn;
 	bool flush;
 
 	/* Validate inputs */
@@ -7204,7 +7253,163 @@ static int kvm_vm_ioctl_unmap_gpa_range(struct kvm *kvm,
 		kvm_flush_remote_tlbs(kvm);
 	write_unlock(&kvm->mmu_lock);
 
+	/*
+	 * Release pinned page references AFTER releasing mmu_lock.
+	 * This is safe because the SPTEs have already been zapped.
+	 */
+	for (gfn = gfn_start; gfn < gfn_end; gfn++) {
+		struct page *page = xa_erase(&slot->usermmu_pages, gfn);
+
+		if (page)
+			put_page(page);
+	}
+
 	return 0;
+}
+
+/*
+ * Batch map multiple GPA ranges in a single ioctl.
+ * All mappings must be to the same USERMMU slot.
+ */
+static int kvm_vm_ioctl_map_gpa_batch(struct kvm *kvm,
+				      struct kvm_gpa_batch_mapping __user *ubatch)
+{
+	struct kvm_memory_slot *slot;
+	struct kvm_gpa_batch_entry *entries = NULL;
+	struct page **pages = NULL;
+	u32 nmappings, slot_id;
+	unsigned int gup_flags;
+	u32 i, mapped;
+	int ret = 0;
+	bool flush = false;
+
+	/* Read header */
+	if (get_user(nmappings, &ubatch->nmappings))
+		return -EFAULT;
+	if (get_user(slot_id, &ubatch->slot))
+		return -EFAULT;
+
+	if (nmappings == 0)
+		return 0;
+
+	/* Sanity limit to avoid huge allocations */
+	if (nmappings > 4096)
+		return -EINVAL;
+
+	/* Allocate and copy entries from userspace */
+	entries = kvmalloc_array(nmappings, sizeof(*entries), GFP_KERNEL_ACCOUNT);
+	if (!entries)
+		return -ENOMEM;
+
+	if (copy_from_user(entries, ubatch->entries,
+			   nmappings * sizeof(*entries))) {
+		ret = -EFAULT;
+		goto out_free_entries;
+	}
+
+	/* Find the memslot and verify it's user-managed */
+	slot = id_to_memslot(kvm_memslots(kvm), slot_id);
+	if (!slot) {
+		ret = -ENOENT;
+		goto out_free_entries;
+	}
+	if (!(slot->flags & KVM_MEM_USERMMU)) {
+		ret = -EINVAL;
+		goto out_free_entries;
+	}
+
+	/* Validate all entries and allocate page array */
+	pages = kvmalloc_array(nmappings, sizeof(*pages), GFP_KERNEL_ACCOUNT);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto out_free_entries;
+	}
+
+	/*
+	 * Pin all user pages BEFORE acquiring mmu_lock to avoid ABBA deadlock.
+	 * We pin one page per entry (each entry is a single page).
+	 */
+	for (i = 0; i < nmappings; i++) {
+		struct kvm_gpa_batch_entry *e = &entries[i];
+
+		/* Validate alignment */
+		if ((e->gpa & (PAGE_SIZE - 1)) || (e->hva & (PAGE_SIZE - 1))) {
+			ret = -EINVAL;
+			goto out_unpin;
+		}
+
+		gup_flags = (e->flags & KVM_GPA_MAP_WRITE) ? FOLL_WRITE : 0;
+		ret = get_user_pages_fast(e->hva, 1, gup_flags, &pages[i]);
+		if (ret != 1) {
+			ret = (ret < 0) ? ret : -EFAULT;
+			goto out_unpin;
+		}
+	}
+
+	/* All pages pinned, now acquire mmu_lock and install mappings */
+	write_lock(&kvm->mmu_lock);
+
+	for (i = 0, mapped = 0; i < nmappings; i++) {
+		struct kvm_gpa_batch_entry *e = &entries[i];
+		gfn_t gfn = e->gpa >> PAGE_SHIFT;
+		kvm_pfn_t pfn = page_to_pfn(pages[i]);
+		struct page *old_page;
+
+		/*
+		 * Yield periodically to avoid holding mmu_lock too long.
+		 * Flush pending TLB entries before yielding.
+		 */
+		if ((i & 31) == 31 &&
+		    (need_resched() || rwlock_needbreak(&kvm->mmu_lock))) {
+			if (flush) {
+				kvm_flush_remote_tlbs(kvm);
+				flush = false;
+			}
+			cond_resched_rwlock_write(&kvm->mmu_lock);
+		}
+
+		ret = kvm_tdp_mmu_map_user(kvm, slot, gfn, pfn,
+					   e->flags, &flush);
+		if (ret) {
+			/* Unpin remaining pages on error */
+			u32 j;
+			for (j = i; j < nmappings; j++)
+				put_page(pages[j]);
+			goto out_unlock;
+		}
+
+		/*
+		 * Track the pinned page in xarray for later release.
+		 * Handle re-mapping: if GFN was already mapped, release old page.
+		 */
+		old_page = xa_store(&slot->usermmu_pages, gfn, pages[i],
+				    GFP_NOWAIT);
+		if (old_page)
+			put_page(old_page);
+
+		mapped++;
+	}
+
+	ret = 0;
+
+out_unlock:
+	/* Single TLB flush for all pages mapped in this batch */
+	if (flush)
+		kvm_flush_remote_tlbs(kvm);
+
+	write_unlock(&kvm->mmu_lock);
+	kvfree(pages);
+	kvfree(entries);
+	return ret;
+
+out_unpin:
+	/* Unpin pages we already pinned */
+	while (i-- > 0)
+		put_page(pages[i]);
+	kvfree(pages);
+out_free_entries:
+	kvfree(entries);
+	return ret;
 }
 
 int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
@@ -7577,6 +7782,9 @@ set_pit2_out:
 		r = kvm_vm_ioctl_unmap_gpa_range(kvm, &unmap);
 		break;
 	}
+	case KVM_MAP_GPA_BATCH:
+		r = kvm_vm_ioctl_map_gpa_batch(kvm, argp);
+		break;
 	default:
 		r = -ENOTTY;
 	}
