@@ -21,6 +21,7 @@
 #include "irq.h"
 #include "ioapic.h"
 #include "mmu.h"
+#include "mmu/tdp_mmu.h"
 #include "i8254.h"
 #include "tss.h"
 #include "kvm_cache_regs.h"
@@ -2162,14 +2163,14 @@ static int handle_fastpath_set_x2apic_icr_irqoff(struct kvm_vcpu *vcpu, u64 data
 	return 1;
 }
 
-static int handle_fastpath_set_tscdeadline(struct kvm_vcpu *vcpu, u64 data)
-{
-	if (!kvm_can_use_hv_timer(vcpu))
-		return 1;
+// static int handle_fastpath_set_tscdeadline(struct kvm_vcpu *vcpu, u64 data)
+// {
+// 	if (!kvm_can_use_hv_timer(vcpu))
+// 		return 1;
 
-	kvm_set_lapic_tscdeadline_msr(vcpu, data);
-	return 0;
-}
+// 	kvm_set_lapic_tscdeadline_msr(vcpu, data);
+// 	return 0;
+// }
 
 fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu)
 {
@@ -2187,13 +2188,13 @@ fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu)
 			ret = EXIT_FASTPATH_EXIT_HANDLED;
 		}
 		break;
-	case MSR_IA32_TSC_DEADLINE:
-		data = kvm_read_edx_eax(vcpu);
-		if (!handle_fastpath_set_tscdeadline(vcpu, data)) {
-			kvm_skip_emulated_instruction(vcpu);
-			ret = EXIT_FASTPATH_REENTER_GUEST;
-		}
-		break;
+	// case MSR_IA32_TSC_DEADLINE:
+	// 	data = kvm_read_edx_eax(vcpu);
+	// 	if (!handle_fastpath_set_tscdeadline(vcpu, data)) {
+	// 		kvm_skip_emulated_instruction(vcpu);
+	// 		ret = EXIT_FASTPATH_REENTER_GUEST;
+	// 	}
+	// 	break;
 	default:
 		break;
 	}
@@ -2774,6 +2775,102 @@ static void kvm_synchronize_tsc(struct kvm_vcpu *vcpu, u64 *user_value)
 
 	__kvm_synchronize_tsc(vcpu, offset, data, ns, matched);
 	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+}
+
+static int kvm_vcpu_ioctl_set_tsc_config(struct kvm_vcpu *vcpu,
+					 const struct kvm_tsc_config *config)
+{
+	u64 guest_tsc;
+	u32 new_tsc_khz;
+	bool update_tsc;
+
+	if (config->flags & ~KVM_TSC_CONFIG_VALID_FLAGS)
+		return -EINVAL;
+
+	if (config->reserved[0] || config->reserved[1])
+		return -EINVAL;
+
+	update_tsc = config->flags &
+		(KVM_TSC_CONFIG_SET_TSC_KHZ | KVM_TSC_CONFIG_SET_GUEST_TSC);
+
+	if (config->flags & KVM_TSC_CONFIG_SET_TSC_KHZ) {
+		new_tsc_khz = config->tsc_khz ? config->tsc_khz : tsc_khz;
+		if (kvm_set_tsc_khz(vcpu, new_tsc_khz))
+			return -EINVAL;
+	}
+
+	if (update_tsc) {
+		if (config->flags & KVM_TSC_CONFIG_SET_GUEST_TSC)
+			guest_tsc = config->guest_tsc;
+		else
+			guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+
+		kvm_synchronize_tsc(vcpu, &guest_tsc);
+	}
+
+	return 0;
+}
+
+static int kvm_vcpu_ioctl_get_tsc_config(struct kvm_vcpu *vcpu,
+					 struct kvm_tsc_config __user *argp)
+{
+	struct kvm_tsc_config config;
+
+	memset(&config, 0, sizeof(config));
+	config.tsc_khz = vcpu->arch.virtual_tsc_khz;
+	config.guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+
+	if (copy_to_user(argp, &config, sizeof(config)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int kvm_vcpu_ioctl_set_tsc_mode(struct kvm_vcpu *vcpu,
+				       const struct kvm_tsc_mode_data *mode)
+{
+	switch (mode->mode) {
+	case KVM_TSC_MODE_PASSTHROUGH:
+		vcpu->arch.trap_rdtsc = false;
+		vcpu->arch.tsc_mode = KVM_TSC_MODE_PASSTHROUGH;
+		memset(&vcpu->arch.tsc_page, 0, sizeof(vcpu->arch.tsc_page));
+		break;
+	case KVM_TSC_MODE_USER_EXIT:
+		vcpu->arch.trap_rdtsc = true;
+		vcpu->arch.tsc_mode = KVM_TSC_MODE_USER_EXIT;
+		break;
+	case KVM_TSC_MODE_SHARED_PAGE:
+		if (mode->shmem_gpa & (PAGE_SIZE - 1))
+			return -EINVAL;
+		if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.tsc_page,
+					      mode->shmem_gpa,
+					      sizeof(u64) * 2))
+			return -EFAULT;
+		vcpu->arch.trap_rdtsc = true;
+		vcpu->arch.tsc_mode = KVM_TSC_MODE_SHARED_PAGE;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	static_call_cond(kvm_x86_update_rdtsc_exiting)(vcpu);
+	return 0;
+}
+
+static int kvm_vcpu_ioctl_get_tsc_mode(struct kvm_vcpu *vcpu,
+				       struct kvm_tsc_mode_data __user *argp)
+{
+	struct kvm_tsc_mode_data mode;
+
+	memset(&mode, 0, sizeof(mode));
+	mode.mode = vcpu->arch.tsc_mode;
+	if (vcpu->arch.tsc_mode == KVM_TSC_MODE_SHARED_PAGE)
+		mode.shmem_gpa = vcpu->arch.tsc_page.gpa;
+
+	if (copy_to_user(argp, &mode, sizeof(mode)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
@@ -4728,6 +4825,12 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VM_TSC_CONTROL:
 		r = kvm_caps.has_tsc_control;
 		break;
+	case KVM_CAP_TSC_MODE:
+		r = 1;
+		break;
+	case KVM_CAP_TSC_CONFIG:
+		r = 1;
+		break;
 	case KVM_CAP_X2APIC_API:
 		r = KVM_X2APIC_API_VALID_FLAGS;
 		break;
@@ -6096,6 +6199,32 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 
 		goto out;
 	}
+	case KVM_SET_TSC_CONFIG: {
+		struct kvm_tsc_config config;
+
+		r = -EFAULT;
+		if (copy_from_user(&config, argp, sizeof(config)))
+			goto out;
+
+		r = kvm_vcpu_ioctl_set_tsc_config(vcpu, &config);
+		goto out;
+	}
+	case KVM_SET_TSC_MODE: {
+		struct kvm_tsc_mode_data mode;
+
+		r = -EFAULT;
+		if (copy_from_user(&mode, argp, sizeof(mode)))
+			goto out;
+
+		r = kvm_vcpu_ioctl_set_tsc_mode(vcpu, &mode);
+		goto out;
+	}
+	case KVM_GET_TSC_MODE:
+		r = kvm_vcpu_ioctl_get_tsc_mode(vcpu, argp);
+		goto out;
+	case KVM_GET_TSC_CONFIG:
+		r = kvm_vcpu_ioctl_get_tsc_config(vcpu, argp);
+		goto out;
 	case KVM_GET_TSC_KHZ: {
 		r = vcpu->arch.virtual_tsc_khz;
 		goto out;
@@ -6924,6 +7053,160 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
 	return 0;
 }
 
+/*
+ * User-managed MMU ioctl handlers for KVM_MEM_USERMMU memslots.
+ */
+
+static int kvm_vm_ioctl_map_gpa_range(struct kvm *kvm,
+				      struct kvm_gpa_mapping *mapping)
+{
+	struct kvm_memory_slot *slot;
+	struct page **pages = NULL;
+	gfn_t gfn;
+	u64 npages, i;
+	int ret = 0;
+	unsigned int gup_flags;
+
+	/* Validate inputs */
+	if (mapping->size == 0 || mapping->size & (PAGE_SIZE - 1))
+		return -EINVAL;
+	if (mapping->gpa & (PAGE_SIZE - 1))
+		return -EINVAL;
+	if (mapping->hva & (PAGE_SIZE - 1))
+		return -EINVAL;
+
+	gfn = mapping->gpa >> PAGE_SHIFT;
+	npages = mapping->size >> PAGE_SHIFT;
+
+	/* Find the memslot and verify it's user-managed */
+	slot = gfn_to_memslot(kvm, gfn);
+	if (!slot)
+		return -ENOENT;
+	if (!(slot->flags & KVM_MEM_USERMMU))
+		return -EINVAL;
+	if (slot->id != mapping->slot)
+		return -EINVAL;
+
+	/* Allocate array for page pointers */
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL_ACCOUNT);
+	if (!pages)
+		return -ENOMEM;
+
+	/*
+	 * Pin all user pages BEFORE acquiring mmu_lock to avoid ABBA deadlock:
+	 * get_user_pages can trigger page faults which call MMU notifiers
+	 * that need mmu_lock.
+	 */
+	gup_flags = (mapping->flags & KVM_GPA_MAP_WRITE) ? FOLL_WRITE : 0;
+	ret = get_user_pages_fast(mapping->hva, npages, gup_flags, pages);
+	if (ret < 0)
+		goto out_free;
+	if (ret != npages) {
+		/* Partial pin - unpin what we got */
+		for (i = 0; i < ret; i++)
+			put_page(pages[i]);
+		ret = -EFAULT;
+		goto out_free;
+	}
+
+	/* Now acquire mmu_lock and install mappings */
+	write_lock(&kvm->mmu_lock);
+
+	for (i = 0; i < npages; i++) {
+		kvm_pfn_t pfn = page_to_pfn(pages[i]);
+
+		ret = kvm_tdp_mmu_map_user(kvm, slot, gfn + i, pfn, mapping->flags);
+		if (ret) {
+			/* Unpin remaining pages on error */
+			u64 j;
+			for (j = i; j < npages; j++)
+				put_page(pages[j]);
+			goto out_unlock;
+		}
+		/* Note: page ref is held by the mapping, don't put_page here */
+	}
+
+	ret = 0;
+
+out_unlock:
+	write_unlock(&kvm->mmu_lock);
+out_free:
+	kvfree(pages);
+	return ret;
+}
+
+static int kvm_vm_ioctl_protect_gpa_range(struct kvm *kvm,
+					  struct kvm_gpa_protect *protect)
+{
+	struct kvm_memory_slot *slot;
+	gfn_t gfn;
+	u64 npages, i;
+	int ret = 0;
+
+	/* Validate inputs */
+	if (protect->size == 0 || protect->size & (PAGE_SIZE - 1))
+		return -EINVAL;
+	if (protect->gpa & (PAGE_SIZE - 1))
+		return -EINVAL;
+
+	gfn = protect->gpa >> PAGE_SHIFT;
+	npages = protect->size >> PAGE_SHIFT;
+
+	/* Find the memslot and verify it's user-managed */
+	slot = gfn_to_memslot(kvm, gfn);
+	if (!slot)
+		return -ENOENT;
+	if (!(slot->flags & KVM_MEM_USERMMU))
+		return -EINVAL;
+	if (slot->id != protect->slot)
+		return -EINVAL;
+
+	write_lock(&kvm->mmu_lock);
+
+	for (i = 0; i < npages; i++) {
+		ret = kvm_tdp_mmu_protect_user(kvm, slot, gfn + i, protect->flags);
+		if (ret)
+			break;
+	}
+
+	write_unlock(&kvm->mmu_lock);
+	return ret;
+}
+
+static int kvm_vm_ioctl_unmap_gpa_range(struct kvm *kvm,
+					struct kvm_gpa_unmap *unmap)
+{
+	struct kvm_memory_slot *slot;
+	gfn_t gfn_start, gfn_end;
+	bool flush;
+
+	/* Validate inputs */
+	if (unmap->size == 0 || unmap->size & (PAGE_SIZE - 1))
+		return -EINVAL;
+	if (unmap->gpa & (PAGE_SIZE - 1))
+		return -EINVAL;
+
+	gfn_start = unmap->gpa >> PAGE_SHIFT;
+	gfn_end = gfn_start + (unmap->size >> PAGE_SHIFT);
+
+	/* Find the memslot and verify it's user-managed */
+	slot = gfn_to_memslot(kvm, gfn_start);
+	if (!slot)
+		return -ENOENT;
+	if (!(slot->flags & KVM_MEM_USERMMU))
+		return -EINVAL;
+	if (slot->id != unmap->slot)
+		return -EINVAL;
+
+	write_lock(&kvm->mmu_lock);
+	flush = kvm_tdp_mmu_unmap_user(kvm, slot, gfn_start, gfn_end, false);
+	if (flush)
+		kvm_flush_remote_tlbs(kvm);
+	write_unlock(&kvm->mmu_lock);
+
+	return 0;
+}
+
 int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
 	struct kvm *kvm = filp->private_data;
@@ -7262,6 +7545,36 @@ set_pit2_out:
 			return -EFAULT;
 
 		r = kvm_vm_ioctl_set_msr_filter(kvm, &filter);
+		break;
+	}
+	case KVM_MAP_GPA_RANGE: {
+		struct kvm_gpa_mapping mapping;
+
+		r = -EFAULT;
+		if (copy_from_user(&mapping, argp, sizeof(mapping)))
+			goto out;
+
+		r = kvm_vm_ioctl_map_gpa_range(kvm, &mapping);
+		break;
+	}
+	case KVM_PROTECT_GPA_RANGE: {
+		struct kvm_gpa_protect protect;
+
+		r = -EFAULT;
+		if (copy_from_user(&protect, argp, sizeof(protect)))
+			goto out;
+
+		r = kvm_vm_ioctl_protect_gpa_range(kvm, &protect);
+		break;
+	}
+	case KVM_UNMAP_GPA_RANGE: {
+		struct kvm_gpa_unmap unmap;
+
+		r = -EFAULT;
+		if (copy_from_user(&unmap, argp, sizeof(unmap)))
+			goto out;
+
+		r = kvm_vm_ioctl_unmap_gpa_range(kvm, &unmap);
 		break;
 	}
 	default:
@@ -8922,8 +9235,13 @@ int kvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
 	 * This is correct even for TF set by the guest, because "the
 	 * processor will not generate this exception after the instruction
 	 * that sets the TF flag".
+	 *
+	 * Also check KVM_GUESTDBG_SINGLESTEP to handle single-stepping for
+	 * emulated instructions (like RDTSC/RDTSCP) where TF may not be set
+	 * in guest RFLAGS but the hypervisor has requested single-step mode.
 	 */
-	if (unlikely(rflags & X86_EFLAGS_TF))
+	if (unlikely((rflags & X86_EFLAGS_TF) ||
+		     (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)))
 		r = kvm_vcpu_do_singlestep(vcpu);
 	return r;
 }
@@ -11173,6 +11491,30 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 {
 	int r;
 
+
+	/*
+	 * Handle RDTSC register injection before clearing exit_reason.
+	 * If userspace handled a RDTSC exit and set the TSC value,
+	 * write it to guest registers now before VM entry.
+	 *
+	 * This must happen HERE, before we clear exit_reason below,
+	 * otherwise we'll never see the KVM_EXIT_RDTSC value.
+	 */
+	if (unlikely(vcpu->run->exit_reason == KVM_EXIT_RDTSC)) {
+		u64 tsc_value = vcpu->run->rdtsc.value;
+		u32 tsc_aux = vcpu->run->rdtsc.aux;
+		u8 is_rdtscp = vcpu->run->rdtsc.is_rdtscp;
+
+		trace_kvm_rdtsc_inject(vcpu->vcpu_id, is_rdtscp, tsc_value, tsc_aux);
+
+		/* Write TSC value to EDX:EAX */
+		kvm_rax_write(vcpu, (u32)tsc_value);
+		kvm_rdx_write(vcpu, tsc_value >> 32);
+
+		/* For RDTSCP, also write TSC_AUX to ECX */
+		if (is_rdtscp)
+			kvm_rcx_write(vcpu, tsc_aux);
+	}
 	vcpu->run->exit_reason = KVM_EXIT_UNKNOWN;
 	vcpu->arch.l1tf_flush_l1d = true;
 
@@ -12156,6 +12498,8 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.arch_capabilities = kvm_get_arch_capabilities();
 	vcpu->arch.msr_platform_info = MSR_PLATFORM_INFO_CPUID_FAULT;
+	vcpu->arch.tsc_mode = KVM_TSC_MODE_PASSTHROUGH;
+	vcpu->arch.trap_rdtsc = false;
 	kvm_xen_init_vcpu(vcpu);
 	kvm_vcpu_mtrr_init(vcpu);
 	vcpu_load(vcpu);
@@ -13922,6 +14266,8 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rdtsc_inject);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_rdtsc_trap);
 
 static int __init kvm_x86_init(void)
 {

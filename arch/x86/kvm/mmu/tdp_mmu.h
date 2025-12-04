@@ -68,6 +68,14 @@ int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
 u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
 					u64 *spte);
 
+/* User-managed MMU operations for KVM_MEM_USERMMU */
+int kvm_tdp_mmu_map_user(struct kvm *kvm, struct kvm_memory_slot *slot,
+			 gfn_t gfn, kvm_pfn_t pfn, u32 prot);
+int kvm_tdp_mmu_protect_user(struct kvm *kvm, struct kvm_memory_slot *slot,
+			     gfn_t gfn, u32 prot);
+bool kvm_tdp_mmu_unmap_user(struct kvm *kvm, struct kvm_memory_slot *slot,
+			    gfn_t start, gfn_t end, bool flush);
+
 #ifdef CONFIG_X86_64
 static inline bool is_tdp_mmu_page(struct kvm_mmu_page *sp) { return sp->tdp_mmu_page; }
 #else

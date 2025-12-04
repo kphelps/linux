@@ -1817,3 +1817,226 @@ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, u64 addr,
 	 */
 	return rcu_dereference(sptep);
 }
+
+/*
+ * User-managed MMU operations for KVM_MEM_USERMMU memslots.
+ * These functions allow userspace to directly control EPT/NPT mappings.
+ */
+
+/*
+ * Build a leaf SPTE for user-managed MMU with the specified permissions.
+ * This is a simplified version of make_spte() for user-controlled mappings.
+ */
+static u64 make_user_spte(struct kvm *kvm, kvm_pfn_t pfn, u32 prot)
+{
+	u64 spte = SPTE_MMU_PRESENT_MASK;
+
+	/* Set present and accessed bits */
+	spte |= shadow_present_mask;
+	spte |= shadow_accessed_mask;
+
+	/* Always use enabled A/D bits for user-managed pages */
+	spte |= SPTE_TDP_AD_ENABLED;
+
+	/* Set the PFN */
+	spte |= (u64)pfn << PAGE_SHIFT;
+
+	/* Apply memory encryption if needed */
+	if (shadow_me_value)
+		spte |= shadow_me_value;
+
+	/* Handle execute permission */
+	if (prot & KVM_GPA_MAP_EXEC)
+		spte |= shadow_x_mask;
+	else
+		spte |= shadow_nx_mask;
+
+	/* Handle write permission */
+	if (prot & KVM_GPA_MAP_WRITE) {
+		spte |= PT_WRITABLE_MASK | shadow_mmu_writable_mask;
+		spte |= shadow_host_writable_mask;
+		spte |= shadow_dirty_mask;
+	}
+
+	/* Handle read permission (EPT readable bit) */
+	if (prot & KVM_GPA_MAP_READ)
+		spte |= SPTE_EPT_READABLE_MASK;
+
+	return spte;
+}
+
+/*
+ * kvm_tdp_mmu_map_user - Install a user-managed EPT/NPT mapping
+ * @kvm: The KVM instance
+ * @slot: The memory slot (must have KVM_MEM_USERMMU flag)
+ * @gfn: Guest frame number to map
+ * @pfn: Host physical frame number
+ * @prot: Protection flags (KVM_GPA_MAP_{READ,WRITE,EXEC})
+ *
+ * Installs a leaf SPTE mapping the given GFN to the given PFN with the
+ * specified permissions. If intermediate page table levels don't exist,
+ * they will be created.
+ *
+ * Must be called with mmu_lock held for write.
+ * Returns 0 on success, negative error code on failure.
+ */
+int kvm_tdp_mmu_map_user(struct kvm *kvm, struct kvm_memory_slot *slot,
+			 gfn_t gfn, kvm_pfn_t pfn, u32 prot)
+{
+	struct kvm_mmu_page *root;
+	struct tdp_iter iter;
+	u64 new_spte;
+	int ret = 0;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	/* Build the new SPTE */
+	new_spte = make_user_spte(kvm, pfn, prot);
+
+	for_each_tdp_mmu_root(kvm, root, slot->as_id) {
+		rcu_read_lock();
+
+		for_each_tdp_pte_min_level(iter, root, PG_LEVEL_4K, gfn, gfn + 1) {
+			/*
+			 * If we hit a non-present SPTE at an intermediate level,
+			 * allocate and link a new page table.
+			 */
+			if (!is_shadow_present_pte(iter.old_spte) &&
+			    iter.level > PG_LEVEL_4K) {
+				struct kvm_mmu_page *sp;
+				int r;
+
+				/*
+				 * Allocate a shadow page for the intermediate
+				 * page table. Must use GFP_NOWAIT since we're
+				 * inside rcu_read_lock() where sleeping is not
+				 * allowed.
+				 */
+				sp = __tdp_mmu_alloc_sp_for_split(GFP_NOWAIT | __GFP_ACCOUNT);
+				if (!sp) {
+					ret = -ENOMEM;
+					goto out_rcu;
+				}
+
+				/* Initialize and link the shadow page */
+				tdp_mmu_init_child_sp(sp, &iter);
+				r = tdp_mmu_link_sp(kvm, &iter, sp, false);
+				if (r) {
+					tdp_mmu_free_sp(sp);
+					ret = r;
+					goto out_rcu;
+				}
+				/*
+				 * Successfully linked the page table.
+				 * Continue iteration to descend into it.
+				 */
+				continue;
+			}
+
+			if (iter.level == PG_LEVEL_4K) {
+				/* Found the target level, install the SPTE */
+				tdp_mmu_iter_set_spte(kvm, &iter, new_spte);
+				break;
+			}
+		}
+
+out_rcu:
+		rcu_read_unlock();
+
+		if (ret)
+			break;
+	}
+
+	/* Flush TLB for the affected GFN */
+	if (!ret)
+		kvm_flush_remote_tlbs_gfn(kvm, gfn, PG_LEVEL_4K);
+
+	return ret;
+}
+
+/*
+ * kvm_tdp_mmu_protect_user - Change permissions on a user-managed mapping
+ * @kvm: The KVM instance
+ * @slot: The memory slot (must have KVM_MEM_USERMMU flag)
+ * @gfn: Guest frame number to modify
+ * @prot: New protection flags (KVM_GPA_MAP_{READ,WRITE,EXEC})
+ *
+ * Updates the permissions on an existing leaf SPTE. The mapping must
+ * already exist.
+ *
+ * Must be called with mmu_lock held for write.
+ * Returns 0 on success, -ENOENT if no mapping exists.
+ */
+int kvm_tdp_mmu_protect_user(struct kvm *kvm, struct kvm_memory_slot *slot,
+			     gfn_t gfn, u32 prot)
+{
+	struct kvm_mmu_page *root;
+	struct tdp_iter iter;
+	u64 new_spte, old_spte;
+	bool found = false;
+	kvm_pfn_t pfn;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	for_each_tdp_mmu_root(kvm, root, slot->as_id) {
+		rcu_read_lock();
+
+		tdp_root_for_each_leaf_pte(iter, root, gfn, gfn + 1) {
+			if (iter.gfn != gfn)
+				continue;
+
+			old_spte = iter.old_spte;
+			pfn = spte_to_pfn(old_spte);
+
+			/* Build new SPTE with updated permissions but same PFN */
+			new_spte = make_user_spte(kvm, pfn, prot);
+
+			/* Preserve accessed/dirty bits from old SPTE */
+			if (is_accessed_spte(old_spte))
+				new_spte |= shadow_accessed_mask;
+			if (is_dirty_spte(old_spte))
+				new_spte |= shadow_dirty_mask;
+
+			tdp_mmu_iter_set_spte(kvm, &iter, new_spte);
+			found = true;
+			break;
+		}
+
+		rcu_read_unlock();
+
+		if (found)
+			break;
+	}
+
+	if (found)
+		kvm_flush_remote_tlbs_gfn(kvm, gfn, PG_LEVEL_4K);
+
+	return found ? 0 : -ENOENT;
+}
+
+/*
+ * kvm_tdp_mmu_unmap_user - Remove user-managed mappings in a GFN range
+ * @kvm: The KVM instance
+ * @slot: The memory slot (must have KVM_MEM_USERMMU flag)
+ * @start: First GFN to unmap (inclusive)
+ * @end: Last GFN to unmap (exclusive)
+ * @flush: Whether a TLB flush is pending
+ *
+ * Clears all leaf SPTEs in the given GFN range. This is essentially a
+ * wrapper around the existing zap functionality for user-managed slots.
+ *
+ * Must be called with mmu_lock held for write.
+ * Returns true if any SPTEs were zapped (TLB flush needed).
+ */
+bool kvm_tdp_mmu_unmap_user(struct kvm *kvm, struct kvm_memory_slot *slot,
+			    gfn_t start, gfn_t end, bool flush)
+{
+	struct kvm_mmu_page *root;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	for_each_tdp_mmu_root(kvm, root, slot->as_id)
+		flush = tdp_mmu_zap_leafs(kvm, root, start, end, true, flush);
+
+	return flush;
+}

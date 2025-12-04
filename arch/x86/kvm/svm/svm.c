@@ -1190,11 +1190,31 @@ static void svm_recalc_instruction_intercepts(struct kvm_vcpu *vcpu,
 			svm_clr_intercept(svm, INTERCEPT_INVPCID);
 	}
 
+	if (vcpu->arch.trap_rdtsc)
+		svm_set_intercept(svm, INTERCEPT_RDTSC);
+	else
+		svm_clr_intercept(svm, INTERCEPT_RDTSC);
+
 	if (kvm_cpu_cap_has(X86_FEATURE_RDTSCP)) {
-		if (guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP))
+		if (vcpu->arch.trap_rdtsc)
+			svm_set_intercept(svm, INTERCEPT_RDTSCP);
+		else if (guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP))
 			svm_clr_intercept(svm, INTERCEPT_RDTSCP);
 		else
 			svm_set_intercept(svm, INTERCEPT_RDTSCP);
+	}
+}
+
+static void svm_update_rdtsc_exiting(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+
+	if (vcpu->arch.trap_rdtsc) {
+		svm_set_intercept(svm, INTERCEPT_RDTSC);
+		svm_set_intercept(svm, INTERCEPT_RDTSCP);
+	} else {
+		svm_clr_intercept(svm, INTERCEPT_RDTSC);
+		svm_recalc_instruction_intercepts(vcpu, svm);
 	}
 }
 
@@ -2109,6 +2129,43 @@ static int bp_interception(struct kvm_vcpu *vcpu)
 	kvm_run->exit_reason = KVM_EXIT_DEBUG;
 	kvm_run->debug.arch.pc = svm->vmcb->save.cs.base + svm->vmcb->save.rip;
 	kvm_run->debug.arch.exception = BP_VECTOR;
+	return 0;
+}
+
+static int svm_handle_rdtsc(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+	bool is_rdtscp = svm->vmcb->control.exit_code == SVM_EXIT_RDTSCP;
+	struct {
+		u64 tsc;
+		u64 aux;
+	} shared;
+
+	if (!vcpu->arch.trap_rdtsc &&
+	    is_rdtscp && !guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP))
+		return kvm_handle_invalid_op(vcpu);
+
+	trace_kvm_rdtsc_trap(vcpu->vcpu_id, is_rdtscp);
+
+	if (vcpu->arch.tsc_mode == KVM_TSC_MODE_SHARED_PAGE) {
+		if (!kvm_read_guest_cached(vcpu->kvm, &vcpu->arch.tsc_page,
+					   &shared, sizeof(shared))) {
+			kvm_rax_write(vcpu, (u32)shared.tsc);
+			kvm_rdx_write(vcpu, shared.tsc >> 32);
+			if (is_rdtscp)
+				kvm_rcx_write(vcpu, shared.aux);
+			kvm_skip_emulated_instruction(vcpu);
+			return 1;
+		}
+	}
+
+	vcpu->run->exit_reason = KVM_EXIT_RDTSC;
+	vcpu->run->rdtsc.is_rdtscp = is_rdtscp ? 1 : 0;
+
+	vcpu->run->rdtsc.value = 0;
+	vcpu->run->rdtsc.aux = 0;
+
+	kvm_skip_emulated_instruction(vcpu);
 	return 0;
 }
 
@@ -3330,7 +3387,8 @@ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[SVM_EXIT_STGI]				= stgi_interception,
 	[SVM_EXIT_CLGI]				= clgi_interception,
 	[SVM_EXIT_SKINIT]			= skinit_interception,
-	[SVM_EXIT_RDTSCP]			= kvm_handle_invalid_op,
+	[SVM_EXIT_RDTSC]			= svm_handle_rdtsc,
+	[SVM_EXIT_RDTSCP]			= svm_handle_rdtsc,
 	[SVM_EXIT_WBINVD]                       = kvm_emulate_wbinvd,
 	[SVM_EXIT_MONITOR]			= kvm_emulate_monitor,
 	[SVM_EXIT_MWAIT]			= kvm_emulate_mwait,
@@ -5070,6 +5128,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.get_l2_tsc_multiplier = svm_get_l2_tsc_multiplier,
 	.write_tsc_offset = svm_write_tsc_offset,
 	.write_tsc_multiplier = svm_write_tsc_multiplier,
+	.update_rdtsc_exiting = svm_update_rdtsc_exiting,
 
 	.load_mmu_pgd = svm_load_mmu_pgd,
 

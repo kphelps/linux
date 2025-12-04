@@ -919,6 +919,9 @@ struct kvm_vcpu_arch {
 	u64 msr_ia32_power_ctl;
 	u64 l1_tsc_scaling_ratio;
 	u64 tsc_scaling_ratio; /* current scaling ratio */
+	bool trap_rdtsc;
+	u32 tsc_mode;
+	struct gfn_to_hva_cache tsc_page;
 
 	atomic_t nmi_queued;  /* unprocessed asynchronous NMIs */
 	/* Number of NMIs pending injection, not including hardware vNMIs. */
@@ -1727,6 +1730,7 @@ struct kvm_x86_ops {
 	u64 (*get_l2_tsc_multiplier)(struct kvm_vcpu *vcpu);
 	void (*write_tsc_offset)(struct kvm_vcpu *vcpu);
 	void (*write_tsc_multiplier)(struct kvm_vcpu *vcpu);
+	void (*update_rdtsc_exiting)(struct kvm_vcpu *vcpu);
 
 	/*
 	 * Retrieve somewhat arbitrary exit information.  Intended to

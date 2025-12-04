@@ -6338,6 +6338,75 @@ a single guest_memfd file, but the bound ranges must not overlap).
 
 See KVM_SET_USER_MEMORY_REGION2 for additional details.
 
+4.143 KVM_SET_TSC_CONFIG
+------------------------
+
+:Capability: KVM_CAP_TSC_CONFIG
+:Architectures: x86
+:Type: vcpu ioctl
+:Parameters: struct kvm_tsc_config (in)
+:Returns: 0 on success, -EINVAL on invalid inputs or unsupported rates, -EFAULT on error
+
+KVM_SET_TSC_CONFIG atomically programs the guest-visible TSC base and, optionally,
+its frequency without trapping RDTSC/RDTSCP.
+
+::
+
+  struct kvm_tsc_config {
+	__u32 flags;
+	__u32 tsc_khz;
+	__u64 guest_tsc;
+	__u64 reserved[2];
+  };
+
+``flags`` is a bitmask of:
+
+``KVM_TSC_CONFIG_SET_TSC_KHZ``
+  Use ``tsc_khz`` to set the guest TSC frequency in KHz. A value of 0 behaves
+  like KVM_SET_TSC_KHZ and reverts to the host TSC rate. Requests outside the
+  supported range are rejected with -EINVAL.
+``KVM_TSC_CONFIG_SET_GUEST_TSC``
+  Latch the guest TSC to ``guest_tsc`` at the moment the ioctl executes.
+``KVM_TSC_CONFIG_ENABLE_RDTSC_EXIT``
+  Start intercepting RDTSC/RDTSCP and exit to userspace with KVM_EXIT_RDTSC.
+``KVM_TSC_CONFIG_DISABLE_RDTSC_EXIT``
+  Stop intercepting RDTSC/RDTSCP and allow them to run natively.
+``KVM_TSC_CONFIG_FREEZE_TSC``
+  Freeze the guest TSC at the provided (or current) value. Implies
+  RDTSC/RDTSCP exits so KVM can return the constant value to the guest.
+
+All other flag bits and the ``reserved`` array must be zero.
+
+If ``KVM_TSC_CONFIG_SET_GUEST_TSC`` is not present, KVM samples the current
+guest TSC and preserves that value while applying any frequency change so that
+the guest observes a continuous counter. The ioctl also updates KVM's TSC
+matching state for the VM.
+
+If both ``KVM_TSC_CONFIG_ENABLE_RDTSC_EXIT`` and ``KVM_TSC_CONFIG_DISABLE_RDTSC_EXIT``
+are set, the ioctl fails with -EINVAL. When RDTSC exiting is enabled, every
+RDTSC/RDTSCP causes a VM-exit with exit_reason=KVM_EXIT_RDTSC; userspace must
+fill ``kvm_run->rdtsc`` and re-enter the guest.
+
+When ``KVM_TSC_CONFIG_FREEZE_TSC`` is set, KVM records the supplied (or current)
+guest TSC and always returns that constant value on RDTSC/RDTSCP exits, without
+advancing it.
+
+4.144 KVM_GET_TSC_CONFIG
+------------------------
+
+:Capability: KVM_CAP_TSC_CONFIG
+:Architectures: x86
+:Type: vcpu ioctl
+:Parameters: struct kvm_tsc_config (out)
+:Returns: 0 on success, -EFAULT on copy error
+
+Returns a snapshot of the current guest TSC mapping. ``flags`` has
+``KVM_TSC_CONFIG_ENABLE_RDTSC_EXIT`` set when RDTSC trapping is active
+(clear otherwise), ``KVM_TSC_CONFIG_FREEZE_TSC`` set when the TSC is frozen,
+``tsc_khz`` is the guest TSC frequency, and ``guest_tsc`` is the guest TSC
+sampled while the ioctl executes.
+Reserved fields are cleared to zero.
+
 5. The kvm_run structure
 ========================
 
@@ -8810,6 +8879,22 @@ Note, KVM_X86_SW_PROTECTED_VM is currently only for development and testing.
 Do not use KVM_X86_SW_PROTECTED_VM for "real" VMs, and especially not in
 production.  The behavior and effective ABI for software-protected VMs is
 unstable.
+
+8.42 KVM_CAP_TSC_CONFIG
+-----------------------
+
+:Capability: KVM_CAP_TSC_CONFIG
+:Architectures: x86
+:Type: system ioctl
+:Parameters: none
+:Returns: 1 if supported, 0 otherwise
+
+This capability advertises support for ``KVM_SET_TSC_CONFIG`` and
+``KVM_GET_TSC_CONFIG``. When present, userspace can program the guest TSC's base
+value and frequency without intercepting RDTSC/RDTSCP, and can optionally opt-in
+to RDTSC/RDTSCP trapping for deterministic emulation. The ioctls still reject
+TSC frequencies that cannot be provided by the underlying hardware or KVM's TSC
+scaling policy.
 
 9. Known KVM API problems
 =========================

@@ -46,6 +46,7 @@ struct kvm_userspace_memory_region2 {
 #define KVM_MEM_LOG_DIRTY_PAGES	(1UL << 0)
 #define KVM_MEM_READONLY	(1UL << 1)
 #define KVM_MEM_GUEST_MEMFD	(1UL << 2)
+#define KVM_MEM_USERMMU		(1UL << 3)  /* User manages stage-2 MMU mappings */
 
 /* for KVM_IRQ_LINE */
 struct kvm_irq_level {
@@ -210,6 +211,8 @@ struct kvm_xen_exit {
 #define KVM_EXIT_NOTIFY           37
 #define KVM_EXIT_LOONGARCH_IOCSR  38
 #define KVM_EXIT_MEMORY_FAULT     39
+#define KVM_EXIT_RDTSC            40
+#define KVM_EXIT_GPA_FAULT        41  /* User-managed MMU GPA fault */
 
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
@@ -442,6 +445,13 @@ struct kvm_run {
 			__u32 index; /* kernel -> user */
 			__u64 data; /* kernel <-> user */
 		} msr;
+		/* KVM_EXIT_RDTSC */
+		struct {
+			__u8 is_rdtscp;  /* kernel -> user: 1 if RDTSCP, 0 if RDTSC */
+			__u8 pad[7];
+			__u64 value;     /* user -> kernel: TSC value to return */
+			__u32 aux;       /* user -> kernel: TSC_AUX for RDTSCP (ECX) */
+		} rdtsc;
 		/* KVM_EXIT_XEN */
 		struct kvm_xen_exit xen;
 		/* KVM_EXIT_RISCV_SBI */
@@ -470,6 +480,15 @@ struct kvm_run {
 			__u64 gpa;
 			__u64 size;
 		} memory_fault;
+		/* KVM_EXIT_GPA_FAULT - User-managed MMU GPA fault */
+		struct {
+#define KVM_GPA_FAULT_READ	(1ULL << 0)
+#define KVM_GPA_FAULT_WRITE	(1ULL << 1)
+#define KVM_GPA_FAULT_EXEC	(1ULL << 2)
+			__u64 flags;
+			__u64 gpa;
+			__u64 size;
+		} gpa_fault;
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -491,6 +510,34 @@ struct kvm_run {
 		struct kvm_sync_regs regs;
 		char padding[SYNC_REGS_SIZE_BYTES];
 	} s;
+};
+
+/* for KVM_MAP_GPA_RANGE - install user-managed MMU mapping */
+struct kvm_gpa_mapping {
+	__u64 gpa;		/* Guest physical address (page-aligned) */
+	__u64 size;		/* Size in bytes (page-aligned) */
+	__u64 hva;		/* Host virtual address of backing memory */
+	__u32 flags;		/* Permission flags: KVM_GPA_MAP_* */
+#define KVM_GPA_MAP_READ	(1 << 0)
+#define KVM_GPA_MAP_WRITE	(1 << 1)
+#define KVM_GPA_MAP_EXEC	(1 << 2)
+	__u32 slot;		/* Memslot ID (must have KVM_MEM_USERMMU) */
+};
+
+/* for KVM_PROTECT_GPA_RANGE - change permissions on existing mapping */
+struct kvm_gpa_protect {
+	__u64 gpa;		/* Guest physical address (page-aligned) */
+	__u64 size;		/* Size in bytes (page-aligned) */
+	__u32 flags;		/* New permission flags: KVM_GPA_MAP_* */
+	__u32 slot;		/* Memslot ID */
+};
+
+/* for KVM_UNMAP_GPA_RANGE - remove user-managed MMU mapping */
+struct kvm_gpa_unmap {
+	__u64 gpa;		/* Guest physical address (page-aligned) */
+	__u64 size;		/* Size in bytes (page-aligned) */
+	__u32 slot;		/* Memslot ID */
+	__u32 pad;
 };
 
 /* for KVM_REGISTER_COALESCED_MMIO / KVM_UNREGISTER_COALESCED_MMIO */
@@ -1155,6 +1202,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_MEMORY_ATTRIBUTES 233
 #define KVM_CAP_GUEST_MEMFD 234
 #define KVM_CAP_VM_TYPES 235
+#define KVM_CAP_TSC_CONFIG 236
+#define KVM_CAP_TSC_MODE 237
 
 #ifdef KVM_CAP_IRQ_ROUTING
 
@@ -1290,6 +1339,38 @@ struct kvm_clock_data {
 	__u64 realtime;
 	__u64 host_tsc;
 	__u32 pad[4];
+};
+
+/*
+ * For KVM_CAP_TSC_CONFIG
+ *
+ * Allows userspace to program the guest-visible TSC value and the
+ * guest TSC frequency in one atomic operation, and optionally
+ * opt into trapping RDTSC/RDTSCP exits.
+ */
+struct kvm_tsc_config {
+	__u32 flags;
+	__u32 tsc_khz;
+	__u64 guest_tsc;
+	__u64 reserved[2];
+};
+
+#define KVM_TSC_CONFIG_SET_GUEST_TSC		BIT(0)
+#define KVM_TSC_CONFIG_SET_TSC_KHZ		BIT(1)
+#define KVM_TSC_CONFIG_VALID_FLAGS \
+		(KVM_TSC_CONFIG_SET_GUEST_TSC | KVM_TSC_CONFIG_SET_TSC_KHZ)
+
+enum kvm_tsc_mode {
+	KVM_TSC_MODE_PASSTHROUGH = 0,
+	KVM_TSC_MODE_USER_EXIT   = 1,
+	KVM_TSC_MODE_SHARED_PAGE = 2,
+};
+
+struct kvm_tsc_mode_data {
+	__u32 mode;
+	__u32 flags;
+	__u64 shmem_gpa;
+	__u64 reserved[2];
 };
 
 /* For KVM_CAP_SW_TLB */
@@ -1482,6 +1563,14 @@ struct kvm_s390_ucas_mapping {
 *  KVM_CAP_VM_TSC_CONTROL to set defaults for a VM */
 #define KVM_SET_TSC_KHZ           _IO(KVMIO,  0xa2)
 #define KVM_GET_TSC_KHZ           _IO(KVMIO,  0xa3)
+/* User-managed MMU operations for KVM_MEM_USERMMU memslots */
+#define KVM_MAP_GPA_RANGE         _IOW(KVMIO, 0xd0, struct kvm_gpa_mapping)
+#define KVM_PROTECT_GPA_RANGE     _IOW(KVMIO, 0xd1, struct kvm_gpa_protect)
+#define KVM_UNMAP_GPA_RANGE       _IOW(KVMIO, 0xd2, struct kvm_gpa_unmap)
+#define KVM_SET_TSC_CONFIG        _IOW(KVMIO, 0xd5, struct kvm_tsc_config)
+#define KVM_GET_TSC_CONFIG        _IOR(KVMIO, 0xd6, struct kvm_tsc_config)
+#define KVM_SET_TSC_MODE          _IOW(KVMIO, 0xd7, struct kvm_tsc_mode_data)
+#define KVM_GET_TSC_MODE          _IOR(KVMIO, 0xd8, struct kvm_tsc_mode_data)
 /* Available with KVM_CAP_SIGNAL_MSI */
 #define KVM_SIGNAL_MSI            _IOW(KVMIO,  0xa5, struct kvm_msi)
 /* Available with KVM_CAP_PPC_GET_SMMU_INFO */

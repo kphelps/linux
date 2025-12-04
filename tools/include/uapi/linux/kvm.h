@@ -1155,6 +1155,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_MEMORY_ATTRIBUTES 233
 #define KVM_CAP_GUEST_MEMFD 234
 #define KVM_CAP_VM_TYPES 235
+#define KVM_CAP_TSC_CONFIG 236
+#define KVM_CAP_TSC_MODE 237
 
 #ifdef KVM_CAP_IRQ_ROUTING
 
@@ -1290,6 +1292,37 @@ struct kvm_clock_data {
 	__u64 realtime;
 	__u64 host_tsc;
 	__u32 pad[4];
+};
+
+/*
+ * For KVM_CAP_TSC_CONFIG
+ *
+ * Allows userspace to program the guest-visible TSC value and frequency in a
+ * single atomic operation, and optionally opt into trapping RDTSC/RDTSCP.
+ */
+struct kvm_tsc_config {
+	__u32 flags;
+	__u32 tsc_khz;
+	__u64 guest_tsc;
+	__u64 reserved[2];
+};
+
+#define KVM_TSC_CONFIG_SET_GUEST_TSC		BIT(0)
+#define KVM_TSC_CONFIG_SET_TSC_KHZ		BIT(1)
+#define KVM_TSC_CONFIG_VALID_FLAGS \
+		(KVM_TSC_CONFIG_SET_GUEST_TSC | KVM_TSC_CONFIG_SET_TSC_KHZ)
+
+enum kvm_tsc_mode {
+	KVM_TSC_MODE_PASSTHROUGH = 0,
+	KVM_TSC_MODE_USER_EXIT   = 1,
+	KVM_TSC_MODE_SHARED_PAGE = 2,
+};
+
+struct kvm_tsc_mode_data {
+	__u32 mode;
+	__u32 flags;
+	__u64 shmem_gpa;
+	__u64 reserved[2];
 };
 
 /* For KVM_CAP_SW_TLB */
@@ -1482,6 +1515,10 @@ struct kvm_s390_ucas_mapping {
 *  KVM_CAP_VM_TSC_CONTROL to set defaults for a VM */
 #define KVM_SET_TSC_KHZ           _IO(KVMIO,  0xa2)
 #define KVM_GET_TSC_KHZ           _IO(KVMIO,  0xa3)
+#define KVM_SET_TSC_CONFIG        _IOW(KVMIO, 0xd5, struct kvm_tsc_config)
+#define KVM_GET_TSC_CONFIG        _IOR(KVMIO, 0xd6, struct kvm_tsc_config)
+#define KVM_SET_TSC_MODE          _IOW(KVMIO, 0xd7, struct kvm_tsc_mode_data)
+#define KVM_GET_TSC_MODE          _IOR(KVMIO, 0xd8, struct kvm_tsc_mode_data)
 /* Available with KVM_CAP_SIGNAL_MSI */
 #define KVM_SIGNAL_MSI            _IOW(KVMIO,  0xa5, struct kvm_msi)
 /* Available with KVM_CAP_PPC_GET_SMMU_INFO */

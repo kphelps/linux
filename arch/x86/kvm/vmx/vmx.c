@@ -4457,11 +4457,10 @@ static u32 vmx_exec_control(struct vcpu_vmx *vmx)
 	u32 exec_control = vmcs_config.cpu_based_exec_ctrl;
 
 	/*
-	 * Not used by KVM, but fully supported for nesting, i.e. are allowed in
-	 * vmcs12 and propagated to vmcs02 when set in vmcs12.
+	 * RDTSC_EXITING: Enabled for deterministic execution (trap to userspace)
+	 * Others: Not used by KVM, but fully supported for nesting
 	 */
-	exec_control &= ~(CPU_BASED_RDTSC_EXITING |
-			  CPU_BASED_USE_IO_BITMAPS |
+	exec_control &= ~(CPU_BASED_USE_IO_BITMAPS |
 			  CPU_BASED_MONITOR_TRAP_FLAG |
 			  CPU_BASED_PAUSE_EXITING);
 
@@ -4493,7 +4492,26 @@ static u32 vmx_exec_control(struct vcpu_vmx *vmx)
 				CPU_BASED_MONITOR_EXITING);
 	if (kvm_hlt_in_guest(vmx->vcpu.kvm))
 		exec_control &= ~CPU_BASED_HLT_EXITING;
+
+	if (vmx->vcpu.arch.trap_rdtsc)
+		exec_control |= CPU_BASED_RDTSC_EXITING;
+	else
+		exec_control &= ~CPU_BASED_RDTSC_EXITING;
+
 	return exec_control;
+}
+
+static void vmx_update_rdtsc_exiting(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	if (!(vmcs_config.cpu_based_exec_ctrl & CPU_BASED_RDTSC_EXITING))
+		return;
+
+	if (vcpu->arch.trap_rdtsc)
+		exec_controls_setbit(vmx, CPU_BASED_RDTSC_EXITING);
+	else
+		exec_controls_clearbit(vmx, CPU_BASED_RDTSC_EXITING);
 }
 
 static u64 vmx_tertiary_exec_control(struct vcpu_vmx *vmx)
@@ -5618,6 +5636,65 @@ static int handle_tpr_below_threshold(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+/*
+ * Handle RDTSC and RDTSCP instructions by exiting to userspace.
+ * This allows deterministic execution by letting userspace control TSC values.
+ */
+static int handle_rdtsc(struct kvm_vcpu *vcpu)
+{
+	u32 exit_reason = to_vmx(vcpu)->exit_reason.basic;
+	struct {
+		u64 tsc;
+		u64 aux;
+	} shared;
+
+	trace_kvm_rdtsc_trap(vcpu->vcpu_id,
+			     exit_reason == EXIT_REASON_RDTSCP);
+
+	if (vcpu->arch.tsc_mode == KVM_TSC_MODE_SHARED_PAGE) {
+		if (!kvm_read_guest_cached(vcpu->kvm, &vcpu->arch.tsc_page,
+					   &shared, sizeof(shared))) {
+			kvm_rax_write(vcpu, (u32)shared.tsc);
+			kvm_rdx_write(vcpu, shared.tsc >> 32);
+			if (exit_reason == EXIT_REASON_RDTSCP)
+				kvm_rcx_write(vcpu, shared.aux);
+			return kvm_skip_emulated_instruction(vcpu);
+		}
+	}
+
+	/*
+	 * Populate exit data for userspace:
+	 * - is_rdtscp: distinguishes RDTSC (0) from RDTSCP (1)
+	 * - value: will be set by userspace and written to EDX:EAX
+	 * - aux: will be set by userspace for RDTSCP (written to ECX)
+	 *
+	 * Skip the emulated instruction first. If single-stepping is enabled,
+	 * this will set up KVM_EXIT_DEBUG and return 0. In that case, we must
+	 * exit with the debug exit rather than KVM_EXIT_RDTSC to ensure
+	 * single-step traps are delivered properly.
+	 */
+	if (!kvm_skip_emulated_instruction(vcpu))
+		return 0;  /* Exit with KVM_EXIT_DEBUG for single-step */
+
+	vcpu->run->exit_reason = KVM_EXIT_RDTSC;
+	vcpu->run->rdtsc.is_rdtscp = (exit_reason == EXIT_REASON_RDTSCP) ? 1 : 0;
+
+	vcpu->run->rdtsc.value = 0;  /* userspace will set this */
+	vcpu->run->rdtsc.aux = 0;    /* userspace will set this for RDTSCP */
+
+	/*
+	 * Return 0 to exit to userspace.
+	 * Userspace must:
+	 * 1. Set vcpu->run->rdtsc.value to desired TSC value
+	 * 2. Set vcpu->run->rdtsc.aux to TSC_AUX value (RDTSCP only)
+	 * 3. Call KVM_RUN again
+	 *
+	 * On next entry (vcpu_enter_guest), registers will be updated
+	 * before resuming guest execution.
+	 */
+	return 0;
+}
+
 static int handle_interrupt_window(struct kvm_vcpu *vcpu)
 {
 	exec_controls_clearbit(to_vmx(vcpu), CPU_BASED_INTR_WINDOW_EXITING);
@@ -5747,6 +5824,7 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	unsigned long exit_qualification;
 	gpa_t gpa;
 	u64 error_code;
+	struct kvm_memory_slot *slot;
 
 	exit_qualification = vmx_get_exit_qual(vcpu);
 
@@ -5763,6 +5841,25 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 
 	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
 	trace_kvm_page_fault(vcpu, gpa, exit_qualification);
+
+	/*
+	 * Check if the GPA is in a user-managed MMU memslot.
+	 * If so, exit to userspace instead of resolving the fault.
+	 */
+	slot = gfn_to_memslot(vcpu->kvm, gpa >> PAGE_SHIFT);
+	if (slot && (slot->flags & KVM_MEM_USERMMU)) {
+		vcpu->run->exit_reason = KVM_EXIT_GPA_FAULT;
+		vcpu->run->gpa_fault.gpa = gpa;
+		vcpu->run->gpa_fault.size = 0;
+		vcpu->run->gpa_fault.flags = 0;
+		if (exit_qualification & EPT_VIOLATION_ACC_READ)
+			vcpu->run->gpa_fault.flags |= KVM_GPA_FAULT_READ;
+		if (exit_qualification & EPT_VIOLATION_ACC_WRITE)
+			vcpu->run->gpa_fault.flags |= KVM_GPA_FAULT_WRITE;
+		if (exit_qualification & EPT_VIOLATION_ACC_INSTR)
+			vcpu->run->gpa_fault.flags |= KVM_GPA_FAULT_EXEC;
+		return 0; /* Exit to userspace */
+	}
 
 	/* Is it a read fault? */
 	error_code = (exit_qualification & EPT_VIOLATION_ACC_READ)
@@ -6089,6 +6186,8 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_EXTERNAL_INTERRUPT]      = handle_external_interrupt,
 	[EXIT_REASON_TRIPLE_FAULT]            = handle_triple_fault,
 	[EXIT_REASON_NMI_WINDOW]	      = handle_nmi_window,
+	[EXIT_REASON_RDTSC]                   = handle_rdtsc,
+	[EXIT_REASON_RDTSCP]                  = handle_rdtsc,
 	[EXIT_REASON_IO_INSTRUCTION]          = handle_io,
 	[EXIT_REASON_CR_ACCESS]               = handle_cr,
 	[EXIT_REASON_DR_ACCESS]               = handle_dr,
@@ -8404,6 +8503,7 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
 	.get_l2_tsc_multiplier = vmx_get_l2_tsc_multiplier,
 	.write_tsc_offset = vmx_write_tsc_offset,
 	.write_tsc_multiplier = vmx_write_tsc_multiplier,
+	.update_rdtsc_exiting = vmx_update_rdtsc_exiting,
 
 	.load_mmu_pgd = vmx_load_mmu_pgd,
 

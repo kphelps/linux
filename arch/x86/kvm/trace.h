@@ -893,6 +893,49 @@ TRACE_EVENT(kvm_write_tsc_offset,
 		  __entry->previous_tsc_offset, __entry->next_tsc_offset)
 );
 
+TRACE_EVENT(kvm_rdtsc_inject,
+	TP_PROTO(unsigned int vcpu_id, bool is_rdtscp, __u64 value, __u32 aux),
+	TP_ARGS(vcpu_id, is_rdtscp, value, aux),
+
+	TP_STRUCT__entry(
+		__field(	unsigned int,	vcpu_id			)
+		__field(	bool,	is_rdtscp		)
+		__field(	__u64,	value			)
+		__field(	__u32,	aux			)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id	= vcpu_id;
+		__entry->is_rdtscp	= is_rdtscp;
+		__entry->value		= value;
+		__entry->aux		= aux;
+	),
+
+	TP_printk("vcpu %u %s value 0x%llx aux 0x%x",
+		  __entry->vcpu_id,
+		  __entry->is_rdtscp ? "rdtscp" : "rdtsc",
+		  __entry->value, __entry->aux)
+);
+
+TRACE_EVENT(kvm_rdtsc_trap,
+	TP_PROTO(unsigned int vcpu_id, bool is_rdtscp),
+	TP_ARGS(vcpu_id, is_rdtscp),
+
+	TP_STRUCT__entry(
+		__field(	unsigned int,	vcpu_id			)
+		__field(	bool,	is_rdtscp		)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id	= vcpu_id;
+		__entry->is_rdtscp	= is_rdtscp;
+	),
+
+	TP_printk("vcpu %u trap %s",
+		  __entry->vcpu_id,
+		  __entry->is_rdtscp ? "rdtscp" : "rdtsc")
+);
+
 #ifdef CONFIG_X86_64
 
 #define host_clocks					\
