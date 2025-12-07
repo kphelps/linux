@@ -652,10 +652,23 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
 
-	if (next != real_prev) {
-		cr4_update_pce_mm(next);
-		switch_ldt(real_prev, next);
-	}
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always call cr4_update_pce_mm() and switch_ldt() unconditionally.
+	 * The conditional `if (next != real_prev)` caused divergence because
+	 * cpu_tlbstate.loaded_mm (real_prev) can differ between VMs after
+	 * snapshot restore, causing one VM to take the branch while the other
+	 * skips it. By executing unconditionally, we ensure identical
+	 * instruction sequences regardless of per-CPU TLB state.
+	 *
+	 * Both functions are safe to call unconditionally:
+	 * - cr4_update_pce_mm(): Already patched to always clear CR4.PCE
+	 * - switch_ldt(): Has internal conditional for LDT presence, but the
+	 *   function call itself ensures deterministic code path. Most modern
+	 *   workloads don't use LDT, so this is typically a no-op.
+	 */
+	cr4_update_pce_mm(next);
+	switch_ldt(real_prev, next);
 }
 
 /*

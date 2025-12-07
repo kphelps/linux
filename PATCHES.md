@@ -195,3 +195,56 @@ With eager TLB flushes (patch 004), spurious faults should NOT occur. If this in
 - Added `GEMVISOR_SPURIOUS_FAULT_PORT` (0x511) handling in `handle_io_out()`
 - Logs warning: "SPURIOUS_KERNEL_FAULT: Guest handled spurious fault at {addr}"
 - Any occurrence of this warning indicates a determinism bug to investigate
+
+## 10. Unconditional switch_mm_irqs_off Operations
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/mm/tlb.c`
+
+**Change:**
+Remove the conditional around `cr4_update_pce_mm()` and `switch_ldt()` calls at the end of `switch_mm_irqs_off()`:
+
+```diff
+ 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
+ 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
+
+-	if (next != real_prev) {
+-		cr4_update_pce_mm(next);
+-		switch_ldt(real_prev, next);
+-	}
++	/*
++	 * GEMVISOR DETERMINISM PATCH:
++	 * Always call cr4_update_pce_mm() and switch_ldt() unconditionally.
++	 */
++	cr4_update_pce_mm(next);
++	switch_ldt(real_prev, next);
+ }
+```
+
+**Reason:**
+The conditional `if (next != real_prev)` compares the `next` mm_struct with `real_prev`, which is read from the per-CPU `cpu_tlbstate.loaded_mm` at function entry. After snapshot restore, this per-CPU state can differ between VMs even when executing from the same logical point:
+
+1. `real_prev = this_cpu_read(cpu_tlbstate.loaded_mm)` - reads per-CPU TLB state
+2. At line 655: `if (next != real_prev)` - conditional on per-CPU state
+3. VM A may have `next != real_prev` (true) and take the branch
+4. VM B may have `next == real_prev` (false) and skip the branch
+5. This causes RIP divergence with identical vtime/retired counts
+
+The divergence manifests as:
+- VM A at `switch_ldt` (already past cr4_update_pce_mm)
+- VM B at `cr4_update_irqsoff` (inside cr4_update_pce_mm)
+
+By removing the conditional, both VMs always execute the same code path regardless of per-CPU TLB state.
+
+**Impact:**
+- Eliminates per-CPU state divergence in switch_mm_irqs_off
+- Both functions are safe to call unconditionally:
+  - `cr4_update_pce_mm()`: Always clears CR4.PCE (via patch 006)
+  - `switch_ldt()`: Internal conditional checks for LDT presence; no-op for most workloads
+- Minimal performance impact: extra function calls that typically do nothing
+- Required for instruction-level determinism during mm context switches
+
+**Related Patches:**
+- Patch 006: Deterministic CR4.PCE updates (cr4_update_pce_mm always clears PCE)
+- Patch 008: Additional CR4 update determinism (cr4_update_irqsoff always writes CR4)

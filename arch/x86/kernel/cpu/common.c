@@ -449,18 +449,25 @@ EXPORT_SYMBOL_GPL(native_write_cr4);
 
 void cr4_update_irqsoff(unsigned long set, unsigned long clear)
 {
-	unsigned long newval, cr4 = this_cpu_read(cpu_tlbstate.cr4);
+	unsigned long newval, cr4;
 
 	lockdep_assert_irqs_disabled();
 
-	newval = (cr4 & ~clear) | set;
 	/*
-	 * GEMVISOR DETERMINISM PATCH:
-	 * Always update shadow and write CR4, even if value unchanged.
-	 * The conditional path caused divergence because cpu_tlbstate.cr4
-	 * differs between VMs after snapshot restore. Forcing the write
-	 * ensures identical instruction sequences.
+	 * GEMVISOR DETERMINISM PATCH (v2):
+	 * Read actual CR4 register instead of per-CPU shadow (cpu_tlbstate.cr4).
+	 * The per-CPU shadow can differ between VMs after snapshot restore,
+	 * causing cumulative instruction count drift over time. Reading from
+	 * the actual register ensures both VMs compute newval from the same
+	 * base value, eliminating per-CPU state dependency.
+	 *
+	 * Trade-off: __read_cr4() is slower than reading from memory cache,
+	 * but this is necessary for instruction-level determinism.
 	 */
+	cr4 = __read_cr4();
+	newval = (cr4 & ~clear) | set;
+
+	/* Update both shadow and actual register for consistency */
 	this_cpu_write(cpu_tlbstate.cr4, newval);
 	__write_cr4(newval);
 }
