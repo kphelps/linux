@@ -254,12 +254,26 @@ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 	 */
 	clear_asid_other();
 
-	/* Always allocate a fresh ASID slot (skip cache lookup loop) */
-	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
-	if (*new_asid >= TLB_NR_DYN_ASIDS) {
-		*new_asid = 0;
-		this_cpu_write(cpu_tlbstate.next_asid, 1);
-	}
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always use ASID 0 instead of incrementing next_asid counter.
+	 * The original code:
+	 *   *new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
+	 *   if (*new_asid >= TLB_NR_DYN_ASIDS) { *new_asid = 0; ... }
+	 *
+	 * The conditional wrap-around causes different instruction counts when
+	 * next_asid value differs between VMs after snapshot restore (one VM
+	 * might be at ASID 5, another at ASID 6, with different wrap behavior).
+	 *
+	 * By always using ASID 0:
+	 * - No conditional based on per-CPU counter
+	 * - Identical instruction count regardless of prior ASID allocation
+	 * - Always flush TLB (already guaranteed by need_flush=true)
+	 *
+	 * Performance impact: Negligible. ASID rotation is a minor optimization
+	 * and modern TLB hardware handles single-ASID workloads efficiently.
+	 */
+	*new_asid = 0;
 	*need_flush = true;
 }
 
@@ -709,15 +723,26 @@ static void flush_tlb_func(void *info)
 
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
-	 * Removed conditional based on cpu_tlbstate_shared.is_lazy.
-	 * The original early return caused different instruction counts when
-	 * is_lazy state differed between VMs after snapshot restore.
-	 * Always take the lazy path (switch to init_mm and return) to ensure
-	 * deterministic instruction count. This is slightly less efficient
-	 * for non-lazy cases but ensures identical execution across VMs.
+	 * Handle lazy TLB mode deterministically. The original code had:
+	 *   if (is_lazy) { switch_mm_irqs_off(...); return; }
+	 * which caused different instruction counts based on per-CPU state.
+	 *
+	 * For determinism, we ALWAYS read the lazy flag (same instruction count)
+	 * but only act on it for the early-return optimization. Since both VMs
+	 * will read the same value from their (now identical) memory snapshots,
+	 * they'll take the same branch.
+	 *
+	 * The key insight: is_lazy is stored in memory that IS captured in
+	 * snapshots (cpu_tlbstate_shared), so after restore both VMs have
+	 * identical values. We just need to ensure the READ happens deterministically.
 	 */
-	switch_mm_irqs_off(NULL, &init_mm, NULL);
-	return;
+	if (this_cpu_read(cpu_tlbstate_shared.is_lazy)) {
+		/*
+		 * We're in lazy mode. Switch to init_mm which invalidates TLB.
+		 */
+		switch_mm_irqs_off(NULL, &init_mm, NULL);
+		return;
+	}
 
 	if (unlikely(f->new_tlb_gen != TLB_GENERATION_INVALID &&
 		     f->new_tlb_gen <= local_tlb_gen)) {
