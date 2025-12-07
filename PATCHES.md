@@ -358,3 +358,79 @@ In gemvisor's deterministic execution model:
 - Eliminates mitigation-related instruction count divergence
 - Slightly reduced security (acceptable for deterministic execution)
 - Still updates per-CPU state for kernel consistency
+
+## 13. Remove Per-CPU Variable Reads at switch_mm_irqs_off Entry
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/mm/tlb.c`
+
+**Change:**
+Remove reads of `cpu_tlbstate.loaded_mm_asid` and `cpu_tlbstate_shared.is_lazy` at function entry:
+
+```diff
+ void switch_mm_irqs_off(...)
+ {
+     struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+-    u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+-    bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
++    /* GEMVISOR: Removed prev_asid and was_lazy reads */
+```
+
+**Reason:**
+These per-CPU reads were only used for optimization paths that are now bypassed. Removing them:
+- Eliminates variable instruction counts from cache/memory access patterns
+- Reduces per-CPU state dependency at function entry
+
+## 14. Always Write is_lazy = false Unconditionally
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/mm/tlb.c`
+
+**Change:**
+```diff
+-    if (was_lazy)
+-        this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
++    /* GEMVISOR: Always write unconditionally for identical instruction count */
++    this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
+```
+
+**Reason:**
+The conditional write causes different instruction counts based on lazy TLB state.
+
+## 15. Always Take "Switching MM" Path in switch_mm_irqs_off
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/mm/tlb.c`
+
+**Change:**
+Remove the `if (real_prev == next)` conditional block entirely and always execute the "switching mm" path.
+
+**Original Code Had:**
+1. `if (real_prev == next)` - "not switching" path with early returns
+2. `else` - "switching" path with full mm switch logic
+
+**Patched Code:**
+Always executes the "switching" path regardless of whether real_prev == next.
+
+**Reason:**
+The original code had multiple early returns based on per-CPU state:
+- `if (!was_lazy) return;` - early return based on lazy TLB mode
+- `if (tlb_gen matches) return;` - early return if TLB is up to date
+
+These early returns caused wildly different instruction counts (hundreds of instructions difference) between VMs that happened to have different per-CPU TLB state.
+
+**Impact:**
+- No early returns based on per-CPU state
+- Always allocates fresh ASID (via patched choose_new_asid)
+- Always flushes TLB (via need_flush=true from choose_new_asid)
+- Identical instruction sequence regardless of prior TLB state
+- Thread-to-thread switches within same process now do full mm switch (minor overhead)
+
+**Test Improvement:**
+- Before these patches: Failed at iteration 1, quantum 920 (~221K total quanta)
+- After patches 11-12: Failed at iteration 2, quantum 9389 (~449K total quanta)
+- After patches 13-15: Failed at iteration 3, quantum 1267 (~661K total quanta)
+- Total improvement: ~3x more deterministic execution before divergence

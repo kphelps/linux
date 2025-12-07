@@ -405,22 +405,20 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			struct task_struct *tsk)
 {
 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
-	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
-	bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Removed: prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+	 * Removed: was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
+	 *
+	 * These per-CPU reads were used for optimization paths (same-mm switch,
+	 * lazy TLB mode) that are now bypassed for determinism. The reads
+	 * themselves have variable instruction counts based on cache state.
+	 */
 	unsigned cpu = smp_processor_id();
 	unsigned long new_lam;
 	u64 next_tlb_gen;
 	bool need_flush;
 	u16 new_asid;
-
-	/*
-	 * NB: The scheduler will call us with prev == next when switching
-	 * from lazy TLB mode to normal mode if active_mm isn't changing.
-	 * When this happens, we don't assume that CR3 (and hence
-	 * cpu_tlbstate.loaded_mm) matches next.
-	 *
-	 * NB: leave_mm() calls us with prev == NULL and tsk == NULL.
-	 */
 
 	/* We don't want flush_tlb_func() to run concurrently with us. */
 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
@@ -453,8 +451,14 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		__flush_tlb_all();
 	}
 #endif
-	if (was_lazy)
-		this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always write is_lazy = false unconditionally.
+	 * The original `if (was_lazy)` conditional causes different instruction
+	 * counts based on per-CPU state. By always writing, we ensure identical
+	 * instruction sequences regardless of prior lazy TLB state.
+	 */
+	this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
 
 	/*
 	 * The membarrier system call requires a full memory barrier and
@@ -468,80 +472,44 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * provides that full memory barrier and core serializing
 	 * instruction.
 	 */
-	if (real_prev == next) {
-		/* Not actually switching mm's */
-		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
-			   next->context.ctx_id);
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always take the "switching mm" code path regardless of whether
+	 * real_prev == next. The original code had multiple early returns
+	 * based on per-CPU state (was_lazy, tlb_gen) that caused wildly
+	 * different instruction counts between VMs.
+	 *
+	 * By always treating this as a mm switch:
+	 * - No early returns based on per-CPU state
+	 * - Always allocate fresh ASID (via patched choose_new_asid)
+	 * - Always flush TLB (via need_flush=true from choose_new_asid)
+	 * - Identical instruction sequence regardless of prior state
+	 *
+	 * The conditional `if (real_prev == next)` checked for scenarios like:
+	 * - Thread-to-thread switch within same process
+	 * - Lazy TLB mode transitions
+	 * These optimizations are sacrificed for determinism.
+	 */
+	cond_mitigation(tsk);
 
-		/*
-		 * If this races with another thread that enables lam, 'new_lam'
-		 * might not match tlbstate_lam_cr3_mask().
-		 */
-
-		/*
-		 * Even in lazy TLB mode, the CPU should stay set in the
-		 * mm_cpumask. The TLB shootdown code can figure out from
-		 * cpu_tlbstate_shared.is_lazy whether or not to send an IPI.
-		 */
-		if (WARN_ON_ONCE(real_prev != &init_mm &&
-				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
-			cpumask_set_cpu(cpu, mm_cpumask(next));
-
-		/*
-		 * If the CPU is not in lazy TLB mode, we are just switching
-		 * from one thread in a process to another thread in the same
-		 * process. No TLB flush required.
-		 */
-		if (!was_lazy)
-			return;
-
-		/*
-		 * Read the tlb_gen to check whether a flush is needed.
-		 * If the TLB is up to date, just use it.
-		 * The barrier synchronizes with the tlb_gen increment in
-		 * the TLB shootdown code.
-		 */
-		smp_mb();
-		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
-		if (this_cpu_read(cpu_tlbstate.ctxs[prev_asid].tlb_gen) ==
-				next_tlb_gen)
-			return;
-
-		/*
-		 * TLB contents went out of date while we were in lazy
-		 * mode. Fall through to the TLB switching code below.
-		 */
-		new_asid = prev_asid;
-		need_flush = true;
-	} else {
-		/*
-		 * Apply process to process speculation vulnerability
-		 * mitigations if applicable.
-		 */
-		cond_mitigation(tsk);
-
-		/*
-		 * Stop remote flushes for the previous mm.
-		 * Skip kernel threads; we never send init_mm TLB flushing IPIs,
-		 * but the bitmap manipulation can cause cache line contention.
-		 */
-		if (real_prev != &init_mm) {
-			VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu,
-						mm_cpumask(real_prev)));
-			cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
-		}
-
-		/* Start receiving IPIs and then read tlb_gen (and LAM below) */
-		if (next != &init_mm)
-			cpumask_set_cpu(cpu, mm_cpumask(next));
-		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
-
-		choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
-
-		/* Let nmi_uaccess_okay() know that we're changing CR3. */
-		this_cpu_write(cpu_tlbstate.loaded_mm, LOADED_MM_SWITCHING);
-		barrier();
+	/*
+	 * Stop remote flushes for the previous mm.
+	 * Skip kernel threads; we never send init_mm TLB flushing IPIs.
+	 */
+	if (real_prev != &init_mm) {
+		cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
 	}
+
+	/* Start receiving IPIs and then read tlb_gen (and LAM below) */
+	if (next != &init_mm)
+		cpumask_set_cpu(cpu, mm_cpumask(next));
+	next_tlb_gen = atomic64_read(&next->context.tlb_gen);
+
+	choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
+
+	/* Let nmi_uaccess_okay() know that we're changing CR3. */
+	this_cpu_write(cpu_tlbstate.loaded_mm, LOADED_MM_SWITCHING);
+	barrier();
 
 	new_lam = mm_lam_cr3_mask(next);
 	set_tlbstate_lam_mode(next);
