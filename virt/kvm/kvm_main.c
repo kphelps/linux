@@ -1030,12 +1030,23 @@ static void kvm_free_memslot(struct kvm *kvm, struct kvm_memory_slot *slot)
 
 	/* Release any pinned pages for user-managed MMU slots */
 	if (slot->flags & KVM_MEM_USERMMU) {
+		struct kvm_usermmu_pinned_region *region, *tmp;
 		struct page *page;
 		unsigned long gfn;
 
+		/* Release ad-hoc mapped pages */
 		xa_for_each(&slot->usermmu_pages, gfn, page)
 			put_page(page);
 		xa_destroy(&slot->usermmu_pages);
+
+		/* Release pre-registered regions */
+		list_for_each_entry_safe(region, tmp, &slot->usermmu_regions, list) {
+			unpin_user_pages(region->pages, region->npages);
+			bitmap_free(region->valid_bitmap);
+			kvfree(region->pages);
+			list_del(&region->list);
+			kfree(region);
+		}
 	}
 
 	kvm_destroy_dirty_bitmap(slot);
@@ -2133,8 +2144,12 @@ int __kvm_set_memory_region(struct kvm *kvm,
 	new->npages = npages;
 	new->flags = mem->flags;
 	new->userspace_addr = mem->userspace_addr;
-	if (mem->flags & KVM_MEM_USERMMU)
+	if (mem->flags & KVM_MEM_USERMMU) {
 		xa_init(&new->usermmu_pages);
+		INIT_LIST_HEAD(&new->usermmu_regions);
+		new->usermmu_region_next_id = 0;
+		new->usermmu_pages_locked = 0;
+	}
 	if (mem->flags & KVM_MEM_GUEST_MEMFD) {
 		r = kvm_gmem_bind(kvm, new, mem->guest_memfd, mem->guest_memfd_offset);
 		if (r)

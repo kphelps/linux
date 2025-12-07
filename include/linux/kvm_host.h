@@ -563,6 +563,20 @@ static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)
 #define KVM_MEM_MAX_NR_PAGES ((1UL << 31) - 1)
 
 /*
+ * Pre-registered USERMMU region - pages are pinned upfront for fast
+ * batch mapping via KVM_MAP_GPA_BATCH with KVM_GPA_BATCH_USE_REGION.
+ */
+struct kvm_usermmu_pinned_region {
+	struct list_head list;		/* Linked into slot->usermmu_regions */
+	u32 id;				/* Unique region ID within slot */
+	u64 base_hva;			/* Starting host virtual address */
+	u64 npages;			/* Number of pages in region */
+	struct page **pages;		/* Array of pinned pages */
+	unsigned long *valid_bitmap;	/* Bitmap: 1 = page still valid */
+	bool write;			/* Pinned with FOLL_WRITE */
+};
+
+/*
  * Since at idle each memslot belongs to two memslot sets it has to contain
  * two embedded nodes for each data structure that it forms a part of.
  *
@@ -600,6 +614,10 @@ struct kvm_memory_slot {
 
 	/* GFN -> struct page* for KVM_MEM_USERMMU slots (page ref tracking) */
 	struct xarray usermmu_pages;
+	/* Pre-registered regions for fast batch mapping */
+	struct list_head usermmu_regions;
+	u32 usermmu_region_next_id;
+	unsigned long usermmu_pages_locked;
 };
 
 static inline bool kvm_slot_can_be_private(const struct kvm_memory_slot *slot)

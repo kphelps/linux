@@ -521,6 +521,8 @@ struct kvm_gpa_mapping {
 #define KVM_GPA_MAP_READ	(1 << 0)
 #define KVM_GPA_MAP_WRITE	(1 << 1)
 #define KVM_GPA_MAP_EXEC	(1 << 2)
+/* Flag for KVM_MAP_GPA_BATCH entries to use pre-registered region */
+#define KVM_GPA_BATCH_USE_REGION	(1 << 8)
 	__u32 slot;		/* Memslot ID (must have KVM_MEM_USERMMU) */
 };
 
@@ -552,6 +554,22 @@ struct kvm_gpa_batch_mapping {
 	__u32 nmappings;	/* Number of entries */
 	__u32 slot;		/* Memslot ID (must have KVM_MEM_USERMMU) */
 	struct kvm_gpa_batch_entry entries[];
+};
+
+/*
+ * for KVM_REGISTER_USERMMU_REGION / KVM_UNREGISTER_USERMMU_REGION
+ * Pre-register a host memory region for fast batch mapping.
+ * Pages are pinned at registration time, eliminating GUP overhead
+ * during subsequent KVM_MAP_GPA_BATCH calls.
+ */
+struct kvm_usermmu_region {
+	__u32 slot;		/* Memslot ID (must have KVM_MEM_USERMMU) */
+	__u32 flags;		/* KVM_USERMMU_REGION_* flags */
+#define KVM_USERMMU_REGION_WRITE	(1 << 0)  /* Pages need write access */
+	__u64 base_hva;		/* Starting host virtual address (page-aligned) */
+	__u64 npages;		/* Number of pages to register */
+	__u32 region_id;	/* Output: assigned region ID */
+	__u32 pad;
 };
 
 /* for KVM_REGISTER_COALESCED_MMIO / KVM_UNREGISTER_COALESCED_MMIO */
@@ -1582,6 +1600,8 @@ struct kvm_s390_ucas_mapping {
 #define KVM_PROTECT_GPA_RANGE     _IOW(KVMIO, 0xd1, struct kvm_gpa_protect)
 #define KVM_UNMAP_GPA_RANGE       _IOW(KVMIO, 0xd2, struct kvm_gpa_unmap)
 #define KVM_MAP_GPA_BATCH         _IOW(KVMIO, 0xd3, struct kvm_gpa_batch_mapping)
+#define KVM_REGISTER_USERMMU_REGION   _IOWR(KVMIO, 0xd4, struct kvm_usermmu_region)
+#define KVM_UNREGISTER_USERMMU_REGION _IOW(KVMIO, 0xd9, struct kvm_usermmu_region)
 #define KVM_SET_TSC_CONFIG        _IOW(KVMIO, 0xd5, struct kvm_tsc_config)
 #define KVM_GET_TSC_CONFIG        _IOR(KVMIO, 0xd6, struct kvm_tsc_config)
 #define KVM_SET_TSC_MODE          _IOW(KVMIO, 0xd7, struct kvm_tsc_mode_data)

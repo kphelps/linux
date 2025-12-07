@@ -7268,6 +7268,180 @@ static int kvm_vm_ioctl_unmap_gpa_range(struct kvm *kvm,
 }
 
 /*
+ * Helper to find a USERMMU region by ID within a slot.
+ */
+static struct kvm_usermmu_pinned_region *
+find_usermmu_region(struct kvm_memory_slot *slot, u32 region_id)
+{
+	struct kvm_usermmu_pinned_region *region;
+
+	list_for_each_entry(region, &slot->usermmu_regions, list) {
+		if (region->id == region_id)
+			return region;
+	}
+	return NULL;
+}
+
+/*
+ * Register a host memory region for pre-pinning.
+ * Pages are pinned upfront, eliminating GUP overhead during batch mapping.
+ */
+static int kvm_vm_ioctl_register_usermmu_region(struct kvm *kvm,
+						struct kvm_usermmu_region __user *user_region)
+{
+	struct kvm_usermmu_region ureq;
+	struct kvm_memory_slot *slot;
+	struct kvm_usermmu_pinned_region *region;
+	unsigned long lock_limit;
+	unsigned int gup_flags;
+	int ret;
+
+	if (copy_from_user(&ureq, user_region, sizeof(ureq)))
+		return -EFAULT;
+
+	/* Validate inputs */
+	if (ureq.base_hva & (PAGE_SIZE - 1))
+		return -EINVAL;
+	if (ureq.npages == 0 || ureq.npages > ULONG_MAX / PAGE_SIZE)
+		return -EINVAL;
+	/* Sanity limit to avoid huge allocations */
+	if (ureq.npages > (1UL << 20))  /* 4GB max */
+		return -EINVAL;
+
+	mutex_lock(&kvm->slots_lock);
+
+	slot = id_to_memslot(kvm_memslots(kvm), ureq.slot);
+	if (!slot) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+	if (!(slot->flags & KVM_MEM_USERMMU)) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	/* RLIMIT_MEMLOCK check */
+	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+	if (slot->usermmu_pages_locked + ureq.npages > lock_limit &&
+	    !capable(CAP_IPC_LOCK)) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	/* Allocate kernel region structure */
+	region = kzalloc(sizeof(*region), GFP_KERNEL);
+	if (!region) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	region->pages = kvmalloc_array(ureq.npages, sizeof(struct page *),
+				       GFP_KERNEL_ACCOUNT);
+	if (!region->pages) {
+		ret = -ENOMEM;
+		goto out_free_region;
+	}
+
+	region->valid_bitmap = bitmap_zalloc(ureq.npages, GFP_KERNEL);
+	if (!region->valid_bitmap) {
+		ret = -ENOMEM;
+		goto out_free_pages;
+	}
+
+	/* Pin all pages upfront using FOLL_LONGTERM */
+	gup_flags = FOLL_LONGTERM;
+	if (ureq.flags & KVM_USERMMU_REGION_WRITE)
+		gup_flags |= FOLL_WRITE;
+
+	ret = pin_user_pages_fast(ureq.base_hva, ureq.npages, gup_flags,
+				  region->pages);
+	if (ret != ureq.npages) {
+		int pinned = (ret > 0) ? ret : 0;
+
+		unpin_user_pages(region->pages, pinned);
+		ret = -EFAULT;
+		goto out_free_bitmap;
+	}
+
+	/* Mark all pages as valid */
+	bitmap_fill(region->valid_bitmap, ureq.npages);
+
+	/* Initialize region */
+	region->id = slot->usermmu_region_next_id++;
+	region->base_hva = ureq.base_hva;
+	region->npages = ureq.npages;
+	region->write = !!(ureq.flags & KVM_USERMMU_REGION_WRITE);
+
+	list_add_tail(&region->list, &slot->usermmu_regions);
+	slot->usermmu_pages_locked += ureq.npages;
+
+	/* Return assigned region ID to userspace */
+	if (put_user(region->id, &user_region->region_id)) {
+		/* Rollback on failure */
+		list_del(&region->list);
+		slot->usermmu_pages_locked -= ureq.npages;
+		unpin_user_pages(region->pages, ureq.npages);
+		ret = -EFAULT;
+		goto out_free_bitmap;
+	}
+
+	mutex_unlock(&kvm->slots_lock);
+	return 0;
+
+out_free_bitmap:
+	bitmap_free(region->valid_bitmap);
+out_free_pages:
+	kvfree(region->pages);
+out_free_region:
+	kfree(region);
+out_unlock:
+	mutex_unlock(&kvm->slots_lock);
+	return ret;
+}
+
+/*
+ * Unregister a pre-registered USERMMU region.
+ */
+static int kvm_vm_ioctl_unregister_usermmu_region(struct kvm *kvm,
+						  struct kvm_usermmu_region __user *user_region)
+{
+	struct kvm_usermmu_region ureq;
+	struct kvm_memory_slot *slot;
+	struct kvm_usermmu_pinned_region *region;
+	int ret = -ENOENT;
+
+	if (copy_from_user(&ureq, user_region, sizeof(ureq)))
+		return -EFAULT;
+
+	mutex_lock(&kvm->slots_lock);
+
+	slot = id_to_memslot(kvm_memslots(kvm), ureq.slot);
+	if (!slot || !(slot->flags & KVM_MEM_USERMMU)) {
+		ret = slot ? -EINVAL : -ENOENT;
+		goto out_unlock;
+	}
+
+	region = find_usermmu_region(slot, ureq.region_id);
+	if (!region) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	/* Free the region */
+	slot->usermmu_pages_locked -= region->npages;
+	unpin_user_pages(region->pages, region->npages);
+	bitmap_free(region->valid_bitmap);
+	kvfree(region->pages);
+	list_del(&region->list);
+	kfree(region);
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&kvm->slots_lock);
+	return ret;
+}
+
+/*
  * Batch map multiple GPA ranges in a single ioctl.
  * All mappings must be to the same USERMMU slot.
  */
@@ -7328,21 +7502,60 @@ static int kvm_vm_ioctl_map_gpa_batch(struct kvm *kvm,
 	/*
 	 * Pin all user pages BEFORE acquiring mmu_lock to avoid ABBA deadlock.
 	 * We pin one page per entry (each entry is a single page).
+	 *
+	 * For entries with KVM_GPA_BATCH_USE_REGION flag, look up the page
+	 * from a pre-registered region (zero GUP overhead).
 	 */
 	for (i = 0; i < nmappings; i++) {
 		struct kvm_gpa_batch_entry *e = &entries[i];
 
-		/* Validate alignment */
-		if ((e->gpa & (PAGE_SIZE - 1)) || (e->hva & (PAGE_SIZE - 1))) {
+		/* Validate GPA alignment */
+		if (e->gpa & (PAGE_SIZE - 1)) {
 			ret = -EINVAL;
 			goto out_unpin;
 		}
 
-		gup_flags = (e->flags & KVM_GPA_MAP_WRITE) ? FOLL_WRITE : 0;
-		ret = get_user_pages_fast(e->hva, 1, gup_flags, &pages[i]);
-		if (ret != 1) {
-			ret = (ret < 0) ? ret : -EFAULT;
-			goto out_unpin;
+		if (e->flags & KVM_GPA_BATCH_USE_REGION) {
+			/*
+			 * Fast path: look up page from pre-registered region.
+			 * Entry format: hva = (region_id << 32) | page_offset
+			 */
+			struct kvm_usermmu_pinned_region *region;
+			u32 region_id = (u32)(e->hva >> 32);
+			u32 offset = (u32)(e->hva);
+
+			region = find_usermmu_region(slot, region_id);
+			if (!region || offset >= region->npages) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+
+			if (!test_bit(offset, region->valid_bitmap)) {
+				ret = -EFAULT;
+				goto out_unpin;
+			}
+
+			/* Check permission compatibility */
+			if ((e->flags & KVM_GPA_MAP_WRITE) && !region->write) {
+				ret = -EPERM;
+				goto out_unpin;
+			}
+
+			pages[i] = region->pages[offset];
+			get_page(pages[i]);  /* Take ref for usermmu_pages tracking */
+		} else {
+			/* Slow path: original GUP-based pinning */
+			if (e->hva & (PAGE_SIZE - 1)) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+
+			gup_flags = (e->flags & KVM_GPA_MAP_WRITE) ? FOLL_WRITE : 0;
+			ret = get_user_pages_fast(e->hva, 1, gup_flags, &pages[i]);
+			if (ret != 1) {
+				ret = (ret < 0) ? ret : -EFAULT;
+				goto out_unpin;
+			}
 		}
 	}
 
@@ -7368,8 +7581,10 @@ static int kvm_vm_ioctl_map_gpa_batch(struct kvm *kvm,
 			cond_resched_rwlock_write(&kvm->mmu_lock);
 		}
 
+		/* Mask out BATCH_USE_REGION - only pass permission flags to TDP MMU */
 		ret = kvm_tdp_mmu_map_user(kvm, slot, gfn, pfn,
-					   e->flags, &flush);
+					   e->flags & (KVM_GPA_MAP_READ | KVM_GPA_MAP_WRITE | KVM_GPA_MAP_EXEC),
+					   &flush);
 		if (ret) {
 			/* Unpin remaining pages on error */
 			u32 j;
@@ -7784,6 +7999,12 @@ set_pit2_out:
 	}
 	case KVM_MAP_GPA_BATCH:
 		r = kvm_vm_ioctl_map_gpa_batch(kvm, argp);
+		break;
+	case KVM_REGISTER_USERMMU_REGION:
+		r = kvm_vm_ioctl_register_usermmu_region(kvm, argp);
+		break;
+	case KVM_UNREGISTER_USERMMU_REGION:
+		r = kvm_vm_ioctl_unregister_usermmu_region(kvm, argp);
 		break;
 	default:
 		r = -ENOTTY;
