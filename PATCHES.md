@@ -248,3 +248,113 @@ By removing the conditional, both VMs always execute the same code path regardle
 **Related Patches:**
 - Patch 006: Deterministic CR4.PCE updates (cr4_update_pce_mm always clears PCE)
 - Patch 008: Additional CR4 update determinism (cr4_update_irqsoff always writes CR4)
+
+## 11. Deterministic ASID Allocation in choose_new_asid
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/mm/tlb.c`
+
+**Change:**
+Skip the ASID cache lookup loop and always allocate a fresh ASID:
+
+```diff
+ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
+ 			    u16 *new_asid, bool *need_flush)
+ {
+-	u16 asid;
+-
+ 	if (!static_cpu_has(X86_FEATURE_PCID)) {
+ 		*new_asid = 0;
+ 		*need_flush = true;
+ 		return;
+ 	}
+
+ 	if (this_cpu_read(cpu_tlbstate.invalidate_other))
+ 		clear_asid_other();
+
+-	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++) {
+-		if (this_cpu_read(cpu_tlbstate.ctxs[asid].ctx_id) !=
+-		    next->context.ctx_id)
+-			continue;
+-
+-		*new_asid = asid;
+-		*need_flush = (this_cpu_read(cpu_tlbstate.ctxs[asid].tlb_gen) <
+-			       next_tlb_gen);
+-		return;
+-	}
+-
++	/* GEMVISOR: Always allocate fresh ASID (skip cache lookup loop) */
+ 	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
+ 	if (*new_asid >= TLB_NR_DYN_ASIDS) {
+ 		*new_asid = 0;
+ 		this_cpu_write(cpu_tlbstate.next_asid, 1);
+ 	}
+ 	*need_flush = true;
+ }
+```
+
+**Reason:**
+The original code loops through `cpu_tlbstate.ctxs[]` searching for a cached ASID with matching ctx_id. This loop's iteration count depends on per-CPU state that can differ between VMs after snapshot restore:
+- VM A might find a cached ASID after 2 iterations
+- VM B might find it after 5 iterations (or not at all)
+- Different loop counts = different instruction counts = divergence
+
+By always allocating a fresh ASID:
+- No dependency on ctxs[] cache state
+- Always `need_flush=true` (guaranteed TLB consistency)
+- Predictable instruction count regardless of per-CPU cache state
+
+**Impact:**
+- Eliminates ASID cache lookup divergence
+- Slightly more TLB flushes (minor performance impact on modern CPUs with INVPCID)
+- Determinism is more valuable than TLB caching for gemvisor
+
+## 12. Skip Speculative Execution Mitigations in cond_mitigation
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/mm/tlb.c`
+
+**Change:**
+Skip IBPB and L1D flush decisions that depend on per-CPU state:
+
+```diff
+ static void cond_mitigation(struct task_struct *next)
+ {
+-	unsigned long prev_mm, next_mm;
++	unsigned long next_mm;
+
+ 	if (!next || !next->mm)
+ 		return;
+
+ 	next_mm = mm_mangle_tif_spec_bits(next);
+-	prev_mm = this_cpu_read(cpu_tlbstate.last_user_mm_spec);
+-
+-	/* [IBPB and L1D flush logic removed for determinism] */
+-	if (static_branch_likely(&switch_mm_cond_ibpb)) {
+-		if (next_mm != prev_mm &&
+-		    (next_mm | prev_mm) & LAST_USER_MM_IBPB)
+-			indirect_branch_prediction_barrier();
+-	}
+-	/* ... additional mitigation checks removed ... */
+
++	/* GEMVISOR: Skip mitigations, just update per-CPU state */
+ 	this_cpu_write(cpu_tlbstate.last_user_mm_spec, next_mm);
+ }
+```
+
+**Reason:**
+The original code reads `cpu_tlbstate.last_user_mm_spec` and compares it with `next_mm` to decide whether to issue IBPB or L1D flush. This creates per-CPU state dependencies:
+- Different `last_user_mm_spec` values → different branch decisions
+- IBPB instruction itself adds non-deterministic branch predictor state
+
+In gemvisor's deterministic execution model:
+- Spectre/Meltdown mitigations are unnecessary (controlled single-process environment)
+- L1D cache timing is not exploitable (deterministic scheduling)
+- IBPB adds non-determinism to branch predictor state
+
+**Impact:**
+- Eliminates mitigation-related instruction count divergence
+- Slightly reduced security (acceptable for deterministic execution)
+- Still updates per-CPU state for kernel consistency

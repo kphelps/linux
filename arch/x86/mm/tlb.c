@@ -219,32 +219,33 @@ atomic64_t last_mm_ctx_id = ATOMIC64_INIT(1);
 static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 			    u16 *new_asid, bool *need_flush)
 {
-	u16 asid;
-
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always allocate a fresh ASID instead of searching the ctxs[] cache.
+	 * The original code loops through cpu_tlbstate.ctxs[] looking for a
+	 * cached ASID with matching ctx_id. This loop's iteration count depends
+	 * on per-CPU state that can differ between VMs after snapshot restore,
+	 * causing different instruction counts for the same logical operation.
+	 *
+	 * By always allocating fresh:
+	 * - No dependency on ctxs[] cache state
+	 * - Always need_flush=true (guaranteed TLB consistency)
+	 * - Predictable instruction count regardless of cache state
+	 *
+	 * Performance impact: Minor. TLB flushes are cheap on modern CPUs with
+	 * INVPCID, and determinism is more valuable than TLB caching.
+	 */
 	if (!static_cpu_has(X86_FEATURE_PCID)) {
 		*new_asid = 0;
 		*need_flush = true;
 		return;
 	}
 
+	/* Skip cache invalidation check - we always flush anyway */
 	if (this_cpu_read(cpu_tlbstate.invalidate_other))
 		clear_asid_other();
 
-	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++) {
-		if (this_cpu_read(cpu_tlbstate.ctxs[asid].ctx_id) !=
-		    next->context.ctx_id)
-			continue;
-
-		*new_asid = asid;
-		*need_flush = (this_cpu_read(cpu_tlbstate.ctxs[asid].tlb_gen) <
-			       next_tlb_gen);
-		return;
-	}
-
-	/*
-	 * We don't currently own an ASID slot on this CPU.
-	 * Allocate a slot.
-	 */
+	/* Always allocate a fresh ASID slot (skip cache lookup loop) */
 	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
 	if (*new_asid >= TLB_NR_DYN_ASIDS) {
 		*new_asid = 0;
@@ -331,41 +332,6 @@ void switch_mm(struct mm_struct *prev, struct mm_struct *next,
 	local_irq_restore(flags);
 }
 
-/*
- * Invoked from return to user/guest by a task that opted-in to L1D
- * flushing but ended up running on an SMT enabled core due to wrong
- * affinity settings or CPU hotplug. This is part of the paranoid L1D flush
- * contract which this task requested.
- */
-static void l1d_flush_force_sigbus(struct callback_head *ch)
-{
-	force_sig(SIGBUS);
-}
-
-static void l1d_flush_evaluate(unsigned long prev_mm, unsigned long next_mm,
-				struct task_struct *next)
-{
-	/* Flush L1D if the outgoing task requests it */
-	if (prev_mm & LAST_USER_MM_L1D_FLUSH)
-		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
-
-	/* Check whether the incoming task opted in for L1D flush */
-	if (likely(!(next_mm & LAST_USER_MM_L1D_FLUSH)))
-		return;
-
-	/*
-	 * Validate that it is not running on an SMT sibling as this would
-	 * make the excercise pointless because the siblings share L1D. If
-	 * it runs on a SMT sibling, notify it with SIGBUS on return to
-	 * user/guest
-	 */
-	if (this_cpu_read(cpu_info.smt_active)) {
-		clear_ti_thread_flag(&next->thread_info, TIF_SPEC_L1D_FLUSH);
-		next->l1d_flush_kill.func = l1d_flush_force_sigbus;
-		task_work_add(next, &next->l1d_flush_kill, TWA_RESUME);
-	}
-}
-
 static unsigned long mm_mangle_tif_spec_bits(struct task_struct *next)
 {
 	unsigned long next_tif = read_task_thread_flags(next);
@@ -382,88 +348,34 @@ static unsigned long mm_mangle_tif_spec_bits(struct task_struct *next)
 
 static void cond_mitigation(struct task_struct *next)
 {
-	unsigned long prev_mm, next_mm;
+	unsigned long next_mm;
 
 	if (!next || !next->mm)
 		return;
 
 	next_mm = mm_mangle_tif_spec_bits(next);
-	prev_mm = this_cpu_read(cpu_tlbstate.last_user_mm_spec);
 
 	/*
-	 * Avoid user/user BTB poisoning by flushing the branch predictor
-	 * when switching between processes. This stops one process from
-	 * doing Spectre-v2 attacks on another.
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Skip all speculative execution mitigations (IBPB, L1D flush) that
+	 * depend on per-CPU state (cpu_tlbstate.last_user_mm_spec).
 	 *
-	 * Both, the conditional and the always IBPB mode use the mm
-	 * pointer to avoid the IBPB when switching between tasks of the
-	 * same process. Using the mm pointer instead of mm->context.ctx_id
-	 * opens a hypothetical hole vs. mm_struct reuse, which is more or
-	 * less impossible to control by an attacker. Aside of that it
-	 * would only affect the first schedule so the theoretically
-	 * exposed data is not really interesting.
+	 * The original code reads last_user_mm_spec and compares it with
+	 * next_mm to decide whether to issue IBPB or L1D flush. This creates
+	 * a dependency on per-CPU state that can differ between VMs after
+	 * snapshot restore, causing different instruction counts.
+	 *
+	 * In the gemvisor deterministic execution model:
+	 * - Spectre/Meltdown mitigations are not needed (controlled environment)
+	 * - L1D cache timing is not exploitable (deterministic scheduling)
+	 * - IBPB adds non-deterministic branch predictor state
+	 *
+	 * By skipping these mitigations, we ensure identical instruction
+	 * sequences regardless of prior context switch history.
+	 *
+	 * Still update the per-CPU state for other kernel subsystems that
+	 * might read it (though they shouldn't in gemvisor's single-vCPU model).
 	 */
-	if (static_branch_likely(&switch_mm_cond_ibpb)) {
-		/*
-		 * This is a bit more complex than the always mode because
-		 * it has to handle two cases:
-		 *
-		 * 1) Switch from a user space task (potential attacker)
-		 *    which has TIF_SPEC_IB set to a user space task
-		 *    (potential victim) which has TIF_SPEC_IB not set.
-		 *
-		 * 2) Switch from a user space task (potential attacker)
-		 *    which has TIF_SPEC_IB not set to a user space task
-		 *    (potential victim) which has TIF_SPEC_IB set.
-		 *
-		 * This could be done by unconditionally issuing IBPB when
-		 * a task which has TIF_SPEC_IB set is either scheduled in
-		 * or out. Though that results in two flushes when:
-		 *
-		 * - the same user space task is scheduled out and later
-		 *   scheduled in again and only a kernel thread ran in
-		 *   between.
-		 *
-		 * - a user space task belonging to the same process is
-		 *   scheduled in after a kernel thread ran in between
-		 *
-		 * - a user space task belonging to the same process is
-		 *   scheduled in immediately.
-		 *
-		 * Optimize this with reasonably small overhead for the
-		 * above cases. Mangle the TIF_SPEC_IB bit into the mm
-		 * pointer of the incoming task which is stored in
-		 * cpu_tlbstate.last_user_mm_spec for comparison.
-		 *
-		 * Issue IBPB only if the mm's are different and one or
-		 * both have the IBPB bit set.
-		 */
-		if (next_mm != prev_mm &&
-		    (next_mm | prev_mm) & LAST_USER_MM_IBPB)
-			indirect_branch_prediction_barrier();
-	}
-
-	if (static_branch_unlikely(&switch_mm_always_ibpb)) {
-		/*
-		 * Only flush when switching to a user space task with a
-		 * different context than the user space task which ran
-		 * last on this CPU.
-		 */
-		if ((prev_mm & ~LAST_USER_MM_SPEC_MASK) !=
-					(unsigned long)next->mm)
-			indirect_branch_prediction_barrier();
-	}
-
-	if (static_branch_unlikely(&switch_mm_cond_l1d_flush)) {
-		/*
-		 * Flush L1D when the outgoing task requested it and/or
-		 * check whether the incoming task requested L1D flushing
-		 * and ended up on an SMT sibling.
-		 */
-		if (unlikely((prev_mm | next_mm) & LAST_USER_MM_L1D_FLUSH))
-			l1d_flush_evaluate(prev_mm, next_mm, next);
-	}
-
 	this_cpu_write(cpu_tlbstate.last_user_mm_spec, next_mm);
 }
 
