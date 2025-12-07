@@ -11,6 +11,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/string.h>
+#include <asm/early_ioremap.h>
 #include <asm/gemvisor_trace.h>
 
 #define RING_BUFFER_SIZE (GEMVISOR_TRACE_PAGE_SIZE - GEMVISOR_TRACE_HEADER_SIZE)
@@ -20,61 +21,42 @@ static struct gem_trace_header __iomem *trace_header;
 static void __iomem *trace_buffer;
 static bool trace_enabled;
 
-/* Issue a VMCALL hypercall */
-static inline u64 gemvisor_hypercall(u64 nr, u64 a0)
-{
-	u64 ret;
-	asm volatile("vmcall"
-		: "=a" (ret)
-		: "a" (nr), "b" (a0)
-		: "memory");
-	return ret;
-}
+/* I/O port for trace hypercalls (KVM reliably forwards I/O to userspace) */
+#define GEMVISOR_TRACE_PORT	0x512
 
-/* Check if running under gemvisor */
-static bool __init is_gemvisor_guest(void)
-{
-	/* Check for the magic in the trace header */
-	void __iomem *ptr = ioremap(GEMVISOR_TRACE_PAGE_GPA, GEMVISOR_TRACE_PAGE_SIZE);
-	if (!ptr)
-		return false;
-
-	u32 magic = readl(ptr);
-	iounmap(ptr);
-
-	return magic == GEMVISOR_TRACE_MAGIC;
-}
+/* Trace hypercall commands */
+#define TRACE_CMD_INIT		1
+#define TRACE_CMD_FLUSH		2
 
 void __init gemvisor_trace_init(void)
 {
-	u64 ret;
+	void __iomem *ptr;
+	u32 magic;
 
-	if (!is_gemvisor_guest()) {
-		pr_info("gemvisor-trace: not running under gemvisor\n");
+	/* Use early_ioremap during setup_arch() before slab is ready */
+	ptr = early_ioremap(GEMVISOR_TRACE_PAGE_GPA, GEMVISOR_TRACE_PAGE_SIZE);
+	if (!ptr) {
+		pr_info("gemvisor-trace: early_ioremap failed\n");
 		return;
 	}
 
-	trace_header = ioremap(GEMVISOR_TRACE_PAGE_GPA, GEMVISOR_TRACE_PAGE_SIZE);
-	if (!trace_header) {
-		pr_err("gemvisor-trace: failed to map trace page\n");
+	/* Check for gemvisor magic */
+	magic = readl(ptr);
+	if (magic != GEMVISOR_TRACE_MAGIC) {
+		early_iounmap(ptr, GEMVISOR_TRACE_PAGE_SIZE);
+		pr_info("gemvisor-trace: not running under gemvisor (magic=%#x)\n", magic);
 		return;
 	}
 
+	/* Keep the early mapping as our permanent mapping during boot.
+	 * Note: We could switch to regular ioremap later, but the early
+	 * mapping is sufficient for our purposes.
+	 */
+	trace_header = (struct gem_trace_header __iomem *)ptr;
 	trace_buffer = (void __iomem *)trace_header + GEMVISOR_TRACE_HEADER_SIZE;
 
-	/* Verify magic */
-	if (readl(&trace_header->magic) != GEMVISOR_TRACE_MAGIC) {
-		pr_warn("gemvisor-trace: invalid magic in trace header\n");
-		iounmap(trace_header);
-		trace_header = NULL;
-		return;
-	}
-
-	/* Initialize hypervisor trace subsystem */
-	ret = gemvisor_hypercall(GEMVISOR_HC_TRACE_INIT, 0);
-	if (ret != 0) {
-		pr_warn("gemvisor-trace: TRACE_INIT hypercall failed: %lld\n", ret);
-	}
+	/* Initialize hypervisor trace subsystem via I/O port */
+	outl(TRACE_CMD_INIT, GEMVISOR_TRACE_PORT);
 
 	trace_enabled = true;
 	pr_info("gemvisor-trace: initialized at GPA %#lx\n",
