@@ -64,6 +64,7 @@
 #include <asm/intel-family.h>
 #include <asm/irq_regs.h>
 #include <asm/cpu.h>
+#include <asm/gemvisor_trace.h>
 
 #include "local.h"
 
@@ -453,12 +454,17 @@ static int lapic_next_deadline(unsigned long delta,
 			       struct clock_event_device *evt)
 {
 	u64 tsc;
+	u64 deadline;
 
 	/* This MSR is special and need a special fence: */
 	weak_wrmsr_fence();
 
 	tsc = rdtsc();
-	wrmsrl(MSR_IA32_TSC_DEADLINE, tsc + (((u64) delta) * TSC_DIVISOR));
+	deadline = tsc + (((u64) delta) * TSC_DIVISOR);
+	wrmsrl(MSR_IA32_TSC_DEADLINE, deadline);
+
+	/* Gemvisor trace: timer armed with deadline TSC value */
+	gem_trace_timer_arm(deadline);
 	return 0;
 }
 
@@ -1088,6 +1094,9 @@ static void local_apic_timer_interrupt(void)
 DEFINE_IDTENTRY_SYSVEC(sysvec_apic_timer_interrupt)
 {
 	struct pt_regs *old_regs = set_irq_regs(regs);
+
+	/* Gemvisor trace: timer fired */
+	gem_trace_timer_fire(LOCAL_TIMER_VECTOR);
 
 	apic_eoi();
 	trace_local_timer_entry(LOCAL_TIMER_VECTOR);

@@ -35,6 +35,7 @@
 #include <asm/kvm_para.h>		/* kvm_handle_async_pf		*/
 #include <asm/vdso.h>			/* fixup_vdso_exception()	*/
 #include <asm/irq_stack.h>
+#include <asm/gemvisor_trace.h>		/* gemvisor trace events	*/
 
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
@@ -1493,6 +1494,9 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 {
 	unsigned long address = read_cr2();
 	irqentry_state_t state;
+
+	/* Gemvisor trace: page fault entry with address and error code */
+	gem_trace_page_fault(address, error_code);
 
 	prefetchw(&current->mm->mmap_lock);
 

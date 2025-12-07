@@ -22,6 +22,7 @@
 #include <asm/desc.h>
 #include <asm/traps.h>
 #include <asm/thermal.h>
+#include <asm/gemvisor_trace.h>
 
 #define CREATE_TRACE_POINTS
 #include <asm/trace/irq_vectors.h>
@@ -249,6 +250,9 @@ DEFINE_IDTENTRY_IRQ(common_interrupt)
 	struct pt_regs *old_regs = set_irq_regs(regs);
 	struct irq_desc *desc;
 
+	/* Gemvisor trace: IRQ entry */
+	gem_trace_irq_entry(vector);
+
 	/* entry code tells RCU that we're not quiescent.  Check it. */
 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
 
@@ -266,6 +270,9 @@ DEFINE_IDTENTRY_IRQ(common_interrupt)
 			__this_cpu_write(vector_irq[vector], VECTOR_UNUSED);
 		}
 	}
+
+	/* Gemvisor trace: IRQ exit */
+	gem_trace_irq_exit(vector);
 
 	set_irq_regs(old_regs);
 }

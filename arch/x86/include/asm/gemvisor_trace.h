@@ -72,6 +72,16 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 	gemvisor_trace_emit(GEM_EVT_MILESTONE, 0, &_id, sizeof(_id)); \
 } while (0)
 
+#define gem_trace_timer_arm(deadline_ns) do { \
+	u64 _d = (deadline_ns); \
+	gemvisor_trace_emit(GEM_EVT_TIMER_ARM, 0, &_d, sizeof(_d)); \
+} while (0)
+
+#define gem_trace_timer_fire(vector) do { \
+	u8 _v = (vector); \
+	gemvisor_trace_emit(GEM_EVT_TIMER_FIRE, 0, &_v, sizeof(_v)); \
+} while (0)
+
 #define gem_trace_page_fault(gva, error_code) do { \
 	struct { u64 gva; u32 ec; } __packed _pl = { (gva), (error_code) }; \
 	gemvisor_trace_emit(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl)); \
