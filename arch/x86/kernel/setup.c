@@ -40,6 +40,7 @@
 #include <asm/efi.h>
 #include <asm/gart.h>
 #include <asm/hypervisor.h>
+#include <asm/gemvisor_trace.h>
 #include <asm/io_apic.h>
 #include <asm/kasan.h>
 #include <asm/kaslr.h>
@@ -1316,6 +1317,9 @@ void __init setup_arch(char **cmdline_p)
 #endif
 
 	unwind_init();
+
+	/* Initialize gemvisor guest trace subsystem */
+	gemvisor_trace_init();
 }
 
 #ifdef CONFIG_X86_32
