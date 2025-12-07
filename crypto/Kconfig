@@ -1278,7 +1278,6 @@ config CRYPTO_DRBG
 	tristate
 	default CRYPTO_DRBG_MENU
 	select CRYPTO_RNG
-	select CRYPTO_JITTERENTROPY
 
 endif	# if CRYPTO_DRBG_MENU
 

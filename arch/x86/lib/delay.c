@@ -22,10 +22,30 @@
 #include <asm/delay.h>
 #include <asm/timer.h>
 #include <asm/mwait.h>
+#include <asm/io.h>
 
 #ifdef CONFIG_SMP
 # include <asm/smp.h>
 #endif
+
+/*
+ * Gemvisor IO-port-based delay for deterministic execution.
+ *
+ * Instead of spinning in a loop (which has variable timing due to
+ * PMC skid and instruction count variations), we write the delay
+ * value to an IO port. The hypervisor intercepts this and advances
+ * virtual time by the requested amount.
+ */
+#define GEMVISOR_DELAY_PORT	0x510
+
+static inline void gemvisor_delay_ns(unsigned long ns)
+{
+	/*
+	 * Write delay in nanoseconds to the gemvisor delay port.
+	 * The hypervisor will advance virtual time by this amount.
+	 */
+	outl((u32)ns, GEMVISOR_DELAY_PORT);
+}
 
 static void delay_loop(u64 __loops);
 
@@ -200,7 +220,16 @@ int read_current_timer(unsigned long *timer_val)
 
 void __delay(unsigned long loops)
 {
-	delay_fn(loops);
+	/*
+	 * For gemvisor deterministic execution: convert loops to nanoseconds
+	 * and use IO port to advance virtual time.
+	 *
+	 * loops_per_jiffy corresponds to 1/HZ seconds worth of loops.
+	 * ns = loops * (1e9 / HZ) / lpj
+	 */
+	unsigned long ns = (loops * (1000000000UL / HZ)) / loops_per_jiffy;
+	if (ns > 0)
+		gemvisor_delay_ns(ns);
 }
 EXPORT_SYMBOL(__delay);
 

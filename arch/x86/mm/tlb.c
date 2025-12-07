@@ -468,19 +468,16 @@ static void cond_mitigation(struct task_struct *next)
 }
 
 #ifdef CONFIG_PERF_EVENTS
+/*
+ * GEMVISOR DETERMINISM PATCH:
+ * Force cr4_update_pce_mm() to always clear CR4.PCE for deterministic
+ * execution. The perf_rdpmc_allowed counter can differ across snapshot
+ * restore, causing different code paths in switch_mm_irqs_off().
+ * By always clearing PCE, we ensure consistent behavior.
+ */
 static inline void cr4_update_pce_mm(struct mm_struct *mm)
 {
-	if (static_branch_unlikely(&rdpmc_always_available_key) ||
-	    (!static_branch_unlikely(&rdpmc_never_available_key) &&
-	     atomic_read(&mm->context.perf_rdpmc_allowed))) {
-		/*
-		 * Clear the existing dirty counters to
-		 * prevent the leak for an RDPMC task.
-		 */
-		perf_clear_dirty_counters();
-		cr4_set_bits_irqsoff(X86_CR4_PCE);
-	} else
-		cr4_clear_bits_irqsoff(X86_CR4_PCE);
+	cr4_clear_bits_irqsoff(X86_CR4_PCE); /* GEMVISOR: force deterministic path */
 }
 
 void cr4_update_pce(void *ignored)

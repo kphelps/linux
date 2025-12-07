@@ -454,10 +454,15 @@ void cr4_update_irqsoff(unsigned long set, unsigned long clear)
 	lockdep_assert_irqs_disabled();
 
 	newval = (cr4 & ~clear) | set;
-	if (newval != cr4) {
-		this_cpu_write(cpu_tlbstate.cr4, newval);
-		__write_cr4(newval);
-	}
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always update shadow and write CR4, even if value unchanged.
+	 * The conditional path caused divergence because cpu_tlbstate.cr4
+	 * differs between VMs after snapshot restore. Forcing the write
+	 * ensures identical instruction sequences.
+	 */
+	this_cpu_write(cpu_tlbstate.cr4, newval);
+	__write_cr4(newval);
 }
 EXPORT_SYMBOL(cr4_update_irqsoff);
 

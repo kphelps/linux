@@ -107,9 +107,17 @@ static inline void hw_breakpoint_disable(void)
 	set_debugreg(0UL, 3);
 }
 
+/*
+ * GEMVISOR DETERMINISM PATCH:
+ * Force hw_breakpoint_active() to always return false for deterministic
+ * execution during text_poke operations. The cpu_dr7 per-CPU shadow variable
+ * can have different values across snapshot restore, causing use_temporary_mm()
+ * to take different code paths (calling or skipping hw_breakpoint_disable()).
+ * By always returning false, we ensure consistent behavior.
+ */
 static __always_inline bool hw_breakpoint_active(void)
 {
-	return __this_cpu_read(cpu_dr7) & DR_GLOBAL_ENABLE_MASK;
+	return false; /* GEMVISOR: force deterministic path */
 }
 
 extern void hw_breakpoint_restore(void);

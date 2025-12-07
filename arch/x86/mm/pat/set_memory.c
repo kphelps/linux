@@ -1016,6 +1016,12 @@ static int __should_split_large_page(pte_t *kpte, unsigned long address,
 	new_pte = pfn_pte(old_pfn, new_prot);
 	__set_pmd_pte(kpte, address, new_pte);
 	cpa->flags |= CPA_FLUSHTLB;
+
+	/* Eager flush when increasing permissions (determinism) */
+	if ((pgprot_val(cpa->mask_clr) & _PAGE_NX) ||
+	    (pgprot_val(cpa->mask_set) & _PAGE_RW))
+		flush_tlb_all();
+
 	cpa_inc_lp_preserved(level);
 	return 0;
 }
@@ -1672,6 +1678,11 @@ repeat:
 		if (pte_val(old_pte) != pte_val(new_pte)) {
 			set_pte_atomic(kpte, new_pte);
 			cpa->flags |= CPA_FLUSHTLB;
+
+			/* Eager flush when increasing permissions (determinism) */
+			if ((pgprot_val(cpa->mask_clr) & _PAGE_NX) ||
+			    (pgprot_val(cpa->mask_set) & _PAGE_RW))
+				flush_tlb_one_kernel(address);
 		}
 		cpa->numpages = 1;
 		return 0;

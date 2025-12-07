@@ -7,10 +7,14 @@
 
 static inline unsigned long random_get_entropy(void)
 {
-	if (!IS_ENABLED(CONFIG_X86_TSC) &&
-	    !cpu_feature_enabled(X86_FEATURE_TSC))
-		return random_get_entropy_fallback();
-	return rdtsc();
+	/*
+	 * For deterministic hypervisor execution (gemvisor), return a constant
+	 * value. This disables interrupt-timing-based entropy collection, which
+	 * relies on TSC values at interrupt time that vary non-deterministically
+	 * due to PMC skid. The kernel gets entropy from SETUP_RNG_SEED and
+	 * virtio-rng instead.
+	 */
+	return 0;
 }
 #define random_get_entropy random_get_entropy
 
