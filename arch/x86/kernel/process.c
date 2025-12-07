@@ -680,13 +680,20 @@ void speculation_ctrl_update_current(void)
 
 static inline void cr4_toggle_bits_irqsoff(unsigned long mask)
 {
-	unsigned long newval, cr4 = this_cpu_read(cpu_tlbstate.cr4);
+	unsigned long newval, cr4;
 
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Read actual CR4 register instead of per-CPU shadow to avoid
+	 * divergence when shadow state differs between VMs after snapshot
+	 * restore. Always write to both shadow and hardware unconditionally
+	 * to ensure identical instruction count regardless of prior state.
+	 */
+	cr4 = __read_cr4();
 	newval = cr4 ^ mask;
-	if (newval != cr4) {
-		this_cpu_write(cpu_tlbstate.cr4, newval);
-		__write_cr4(newval);
-	}
+	/* Always write unconditionally for deterministic instruction count */
+	this_cpu_write(cpu_tlbstate.cr4, newval);
+	__write_cr4(newval);
 }
 
 void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p)

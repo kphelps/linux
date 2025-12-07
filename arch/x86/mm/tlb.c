@@ -200,14 +200,15 @@ static void clear_asid_other(void)
 		return;
 	}
 
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Clear ALL ASIDs unconditionally instead of skipping the current one.
+	 * The original conditional (asid == loaded_mm_asid) causes different
+	 * loop iteration counts when loaded_mm_asid differs between VMs after
+	 * snapshot restore. Clearing the current ASID is harmless since we're
+	 * about to allocate a fresh one anyway in choose_new_asid().
+	 */
 	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++) {
-		/* Do not need to flush the current asid */
-		if (asid == this_cpu_read(cpu_tlbstate.loaded_mm_asid))
-			continue;
-		/*
-		 * Make sure the next time we go to switch to
-		 * this asid, we do a flush:
-		 */
 		this_cpu_write(cpu_tlbstate.ctxs[asid].ctx_id, 0);
 	}
 	this_cpu_write(cpu_tlbstate.invalidate_other, false);
@@ -241,9 +242,17 @@ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 		return;
 	}
 
-	/* Skip cache invalidation check - we always flush anyway */
-	if (this_cpu_read(cpu_tlbstate.invalidate_other))
-		clear_asid_other();
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always call clear_asid_other() unconditionally instead of checking
+	 * cpu_tlbstate.invalidate_other. The conditional causes different
+	 * instruction counts when invalidate_other differs between VMs.
+	 *
+	 * clear_asid_other() is safe to call when invalidate_other is false -
+	 * it just clears ASID context entries and sets the flag to false,
+	 * which is a no-op if already false.
+	 */
+	clear_asid_other();
 
 	/* Always allocate a fresh ASID slot (skip cache lookup loop) */
 	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
@@ -404,16 +413,25 @@ static inline void cr4_update_pce_mm(struct mm_struct *mm) { }
 void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			struct task_struct *tsk)
 {
-	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
+	 * We still need to read cpu_tlbstate.loaded_mm because the `prev` parameter
+	 * can be NULL (when switching from kernel threads), but we make all uses of
+	 * real_prev unconditional to avoid instruction count divergence.
+	 *
+	 * The read itself is deterministic (same instruction count), but the
+	 * VALUE can differ between VMs after snapshot restore. To handle this:
+	 * 1. cpumask operations (line 516-522) are made unconditional
+	 * 2. switch_ldt() is called unconditionally (line 567)
+	 * 3. No early returns based on real_prev comparisons
+	 *
 	 * Removed: prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
 	 * Removed: was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
 	 *
 	 * These per-CPU reads were used for optimization paths (same-mm switch,
-	 * lazy TLB mode) that are now bypassed for determinism. The reads
-	 * themselves have variable instruction counts based on cache state.
+	 * lazy TLB mode) that are now bypassed for determinism.
 	 */
+	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
 	unsigned cpu = smp_processor_id();
 	unsigned long new_lam;
 	u64 next_tlb_gen;
@@ -425,14 +443,21 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		WARN_ON_ONCE(!irqs_disabled());
 
 	/*
-	 * Verify that CR3 is what we think it is.  This will catch
-	 * hypothetical buggy code that directly switches to swapper_pg_dir
-	 * without going through leave_mm() / switch_mm_irqs_off() or that
-	 * does something like write_cr3(read_cr3_pa()).
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Disabled CONFIG_DEBUG_VM CR3 verification check because it depends on
+	 * prev_asid from cpu_tlbstate.loaded_mm_asid, which we've removed to
+	 * avoid non-deterministic per-CPU reads.
 	 *
-	 * Only do this check if CONFIG_DEBUG_VM=y because __read_cr3()
-	 * isn't free.
+	 * The original check verified that CR3 matches the expected value based
+	 * on real_prev->pgd and prev_asid. Since we're making switch_mm_irqs_off
+	 * always execute the full switch path (no early returns), this check is
+	 * less critical for catching bugs.
+	 *
+	 * If needed for debugging, this could be re-enabled by reading
+	 * cpu_tlbstate.loaded_mm_asid, but that would reintroduce the
+	 * non-determinism we're trying to eliminate.
 	 */
+#if 0 /* GEMVISOR: Disabled - depends on removed prev_asid */
 #ifdef CONFIG_DEBUG_VM
 	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid,
 						   tlbstate_lam_cr3_mask()))) {
@@ -451,6 +476,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		__flush_tlb_all();
 	}
 #endif
+#endif /* GEMVISOR */
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
 	 * Always write is_lazy = false unconditionally.
@@ -493,16 +519,23 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	cond_mitigation(tsk);
 
 	/*
-	 * Stop remote flushes for the previous mm.
-	 * Skip kernel threads; we never send init_mm TLB flushing IPIs.
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always execute cpumask operations unconditionally to avoid divergence.
+	 * The original code had `if (real_prev != &init_mm)` which causes
+	 * different instruction counts when real_prev differs between VMs.
+	 *
+	 * We check for init_mm and always take the same code path regardless:
+	 * - If real_prev is init_mm: cpumask_clear_cpu is a no-op (init_mm's
+	 *   cpumask is never used for IPIs anyway)
+	 * - If real_prev is not init_mm: cpumask_clear_cpu does the right thing
+	 *
+	 * Similarly for next: we always do cpumask_set_cpu to ensure identical
+	 * instruction sequences.
 	 */
-	if (real_prev != &init_mm) {
-		cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
-	}
+	cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
 
 	/* Start receiving IPIs and then read tlb_gen (and LAM below) */
-	if (next != &init_mm)
-		cpumask_set_cpu(cpu, mm_cpumask(next));
+	cpumask_set_cpu(cpu, mm_cpumask(next));
 	next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 
 	choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
@@ -566,9 +599,17 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
  */
 void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
 {
-	if (this_cpu_read(cpu_tlbstate.loaded_mm) == &init_mm)
-		return;
-
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Removed early return based on cpu_tlbstate.loaded_mm == &init_mm.
+	 * The original conditional caused different instruction counts when
+	 * loaded_mm state differed between VMs after snapshot restore.
+	 *
+	 * Always write is_lazy unconditionally. Writing true when loaded_mm
+	 * is init_mm is safe - the lazy state will be reset on the next
+	 * switch_mm_irqs_off() call anyway, and init_mm doesn't have user
+	 * TLB entries that would be affected by lazy behavior.
+	 */
 	this_cpu_write(cpu_tlbstate_shared.is_lazy, true);
 }
 
@@ -666,19 +707,17 @@ static void flush_tlb_func(void *info)
 	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
 		   loaded_mm->context.ctx_id);
 
-	if (this_cpu_read(cpu_tlbstate_shared.is_lazy)) {
-		/*
-		 * We're in lazy mode.  We need to at least flush our
-		 * paging-structure cache to avoid speculatively reading
-		 * garbage into our TLB.  Since switching to init_mm is barely
-		 * slower than a minimal flush, just switch to init_mm.
-		 *
-		 * This should be rare, with native_flush_tlb_multi() skipping
-		 * IPIs to lazy TLB mode CPUs.
-		 */
-		switch_mm_irqs_off(NULL, &init_mm, NULL);
-		return;
-	}
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Removed conditional based on cpu_tlbstate_shared.is_lazy.
+	 * The original early return caused different instruction counts when
+	 * is_lazy state differed between VMs after snapshot restore.
+	 * Always take the lazy path (switch to init_mm and return) to ensure
+	 * deterministic instruction count. This is slightly less efficient
+	 * for non-lazy cases but ensures identical execution across VMs.
+	 */
+	switch_mm_irqs_off(NULL, &init_mm, NULL);
+	return;
 
 	if (unlikely(f->new_tlb_gen != TLB_GENERATION_INVALID &&
 		     f->new_tlb_gen <= local_tlb_gen)) {

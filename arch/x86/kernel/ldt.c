@@ -137,9 +137,21 @@ static void flush_ldt(void *__mm)
 {
 	struct mm_struct *mm = __mm;
 
-	if (this_cpu_read(cpu_tlbstate.loaded_mm) != mm)
-		return;
-
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Removed early return based on cpu_tlbstate.loaded_mm != mm.
+	 * This conditional causes different instruction counts when loaded_mm
+	 * state differs between VMs after snapshot restore.
+	 *
+	 * Always call load_mm_ldt() and refresh_ldt_segments(). These are safe
+	 * to call even when loaded_mm != mm:
+	 * - load_mm_ldt() will load the LDT for the specified mm, which is
+	 *   correct if this CPU is about to switch to that mm anyway
+	 * - refresh_ldt_segments() updates segment registers, which is safe
+	 *
+	 * For single-vCPU VMs (which gemvisor uses), this IPI handler is only
+	 * called on the current CPU, so loaded_mm should always match.
+	 */
 	load_mm_ldt(mm);
 
 	refresh_ldt_segments();
