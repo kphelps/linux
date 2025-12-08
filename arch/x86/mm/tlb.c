@@ -695,7 +695,7 @@ static void flush_tlb_func(void *info)
 	const struct flush_tlb_info *f = info;
 	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
 	u32 loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
-	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
+	/* GEMVISOR: local_tlb_gen removed - was only used for early-exit optimization */
 	bool local = smp_processor_id() == f->initiating_cpu;
 	unsigned long nr_invalidate = 0;
 	u64 mm_tlb_gen;
@@ -750,16 +750,19 @@ static void flush_tlb_func(void *info)
 		return;
 	}
 
-	if (unlikely(f->new_tlb_gen != TLB_GENERATION_INVALID &&
-		     f->new_tlb_gen <= local_tlb_gen)) {
-		/*
-		 * The TLB is already up to date in respect to f->new_tlb_gen.
-		 * While the core might be still behind mm_tlb_gen, checking
-		 * mm_tlb_gen unnecessarily would have negative caching effects
-		 * so avoid it.
-		 */
-		return;
-	}
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * REMOVED early return based on local_tlb_gen comparison.
+	 *
+	 * The original code had:
+	 *   if (f->new_tlb_gen != TLB_GENERATION_INVALID &&
+	 *       f->new_tlb_gen <= local_tlb_gen)
+	 *       return;
+	 *
+	 * This caused different instruction counts between VMs because
+	 * local_tlb_gen is per-CPU state that can evolve differently.
+	 * Always proceed to the flush to ensure identical execution paths.
+	 */
 
 	/*
 	 * Defer mm_tlb_gen reading as long as possible to avoid cache
@@ -767,90 +770,38 @@ static void flush_tlb_func(void *info)
 	 */
 	mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
 
-	if (unlikely(local_tlb_gen == mm_tlb_gen)) {
-		/*
-		 * There's nothing to do: we're already up to date.  This can
-		 * happen if two concurrent flushes happen -- the first flush to
-		 * be handled can catch us all the way up, leaving no work for
-		 * the second flush.
-		 */
-		goto done;
-	}
-
-	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
-	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * REMOVED early goto based on local_tlb_gen == mm_tlb_gen.
+	 *
+	 * The original code had:
+	 *   if (local_tlb_gen == mm_tlb_gen) goto done;
+	 *
+	 * This caused different instruction counts because the decision
+	 * to skip the flush depends on per-CPU state. Always do the flush.
+	 */
 
 	/*
-	 * If we get to this point, we know that our TLB is out of date.
-	 * This does not strictly imply that we need to flush (it's
-	 * possible that f->new_tlb_gen <= local_tlb_gen), but we're
-	 * going to need to flush in the very near future, so we might
-	 * as well get it over with.
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always do FULL TLB flush, never partial.
 	 *
-	 * The only question is whether to do a full or partial flush.
+	 * The original code chose partial vs full based on:
+	 *   f->new_tlb_gen == local_tlb_gen + 1
 	 *
-	 * We do a partial flush if requested and two extra conditions
-	 * are met:
-	 *
-	 * 1. f->new_tlb_gen == local_tlb_gen + 1.  We have an invariant that
-	 *    we've always done all needed flushes to catch up to
-	 *    local_tlb_gen.  If, for example, local_tlb_gen == 2 and
-	 *    f->new_tlb_gen == 3, then we know that the flush needed to bring
-	 *    us up to date for tlb_gen 3 is the partial flush we're
-	 *    processing.
-	 *
-	 *    As an example of why this check is needed, suppose that there
-	 *    are two concurrent flushes.  The first is a full flush that
-	 *    changes context.tlb_gen from 1 to 2.  The second is a partial
-	 *    flush that changes context.tlb_gen from 2 to 3.  If they get
-	 *    processed on this CPU in reverse order, we'll see
-	 *     local_tlb_gen == 1, mm_tlb_gen == 3, and end != TLB_FLUSH_ALL.
-	 *    If we were to use __flush_tlb_one_user() and set local_tlb_gen to
-	 *    3, we'd be break the invariant: we'd update local_tlb_gen above
-	 *    1 without the full flush that's needed for tlb_gen 2.
-	 *
-	 * 2. f->new_tlb_gen == mm_tlb_gen.  This is purely an optimization.
-	 *    Partial TLB flushes are not all that much cheaper than full TLB
-	 *    flushes, so it seems unlikely that it would be a performance win
-	 *    to do a partial flush if that won't bring our TLB fully up to
-	 *    date.  By doing a full flush instead, we can increase
-	 *    local_tlb_gen all the way to mm_tlb_gen and we can probably
-	 *    avoid another flush in the very near future.
+	 * This per-CPU state comparison caused different execution paths
+	 * (loop vs single flush). For determinism, always do full flush.
+	 * This is slightly less efficient but guarantees identical
+	 * instruction sequences regardless of TLB generation state.
 	 */
-	if (f->end != TLB_FLUSH_ALL &&
-	    f->new_tlb_gen == local_tlb_gen + 1 &&
-	    f->new_tlb_gen == mm_tlb_gen) {
-		/* Partial flush */
-		unsigned long addr = f->start;
-
-		/* Partial flush cannot have invalid generations */
-		VM_WARN_ON(f->new_tlb_gen == TLB_GENERATION_INVALID);
-
-		/* Partial flush must have valid mm */
-		VM_WARN_ON(f->mm == NULL);
-
-		nr_invalidate = (f->end - f->start) >> f->stride_shift;
-
-		while (addr < f->end) {
-			flush_tlb_one_user(addr);
-			addr += 1UL << f->stride_shift;
-		}
-		if (local)
-			count_vm_tlb_events(NR_TLB_LOCAL_FLUSH_ONE, nr_invalidate);
-	} else {
-		/* Full flush. */
-		nr_invalidate = TLB_FLUSH_ALL;
-
-		flush_tlb_local();
-		if (local)
-			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
-	}
+	nr_invalidate = TLB_FLUSH_ALL;
+	flush_tlb_local();
+	if (local)
+		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
 
 	/* Both paths above update our state to mm_tlb_gen. */
 	this_cpu_write(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen, mm_tlb_gen);
 
 	/* Tracing is done in a unified manner to reduce the code size */
-done:
 	trace_tlb_flush(!local ? TLB_REMOTE_SHOOTDOWN :
 				(f->mm == NULL) ? TLB_LOCAL_SHOOTDOWN :
 						  TLB_LOCAL_MM_SHOOTDOWN,
