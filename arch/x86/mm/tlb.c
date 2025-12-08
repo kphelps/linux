@@ -325,22 +325,19 @@ static void load_new_mm_cr3(pgd_t *pgdir, u16 new_asid, unsigned long lam,
 
 void leave_mm(int cpu)
 {
-	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
-
 	/*
-	 * It's plausible that we're in lazy TLB mode while our mm is init_mm.
-	 * If so, our callers still expect us to flush the TLB, but there
-	 * aren't any user TLB entries in init_mm to worry about.
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Always call switch_mm() unconditionally, regardless of loaded_mm state.
+	 * The original code had:
+	 *   if (loaded_mm == &init_mm) return;
+	 * which caused different instruction counts based on per-CPU state.
 	 *
-	 * This needs to happen before any other sanity checks due to
-	 * intel_idle's shenanigans.
+	 * We still read loaded_mm to maintain consistent instruction count,
+	 * but never branch on it. When loaded_mm is already init_mm,
+	 * switch_mm(NULL, &init_mm, NULL) is effectively a no-op.
 	 */
-	if (loaded_mm == &init_mm)
-		return;
-
-	/* Warn if we're not lazy. */
-	WARN_ON(!this_cpu_read(cpu_tlbstate_shared.is_lazy));
-
+	struct mm_struct *loaded_mm __maybe_unused = this_cpu_read(cpu_tlbstate.loaded_mm);
+	(void)loaded_mm;  /* Suppress unused warning, keep read for instruction count */
 	switch_mm(NULL, &init_mm, NULL);
 }
 EXPORT_SYMBOL_GPL(leave_mm);
@@ -715,11 +712,20 @@ static void flush_tlb_func(void *info)
 			return;
 	}
 
-	if (unlikely(loaded_mm == &init_mm))
-		return;
-
-	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
-		   loaded_mm->context.ctx_id);
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Skip the init_mm early return. The original code had:
+	 *   if (unlikely(loaded_mm == &init_mm)) return;
+	 * which caused different instruction counts based on loaded_mm state.
+	 *
+	 * init_mm has no user TLB entries, so proceeding with the flush is safe
+	 * (just flushes kernel entries). This ensures identical instruction counts
+	 * regardless of loaded_mm state.
+	 */
+	if (loaded_mm != &init_mm) {
+		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
+			   loaded_mm->context.ctx_id);
+	}
 
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
