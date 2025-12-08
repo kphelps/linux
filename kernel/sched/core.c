@@ -76,6 +76,7 @@
 #include <asm/irq_regs.h>
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
+#include <asm/gemvisor_trace.h>
 
 #define CREATE_TRACE_POINTS
 #include <linux/sched/rseq_api.h>
@@ -4346,8 +4347,11 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		ttwu_queue(p, cpu, wake_flags);
 	}
 out:
-	if (success)
+	if (success) {
 		ttwu_stat(p, task_cpu(p), wake_flags);
+		/* GEMVISOR: Trace wakeup for divergence debugging */
+		gem_trace_sched_wakeup(p->pid, task_cpu(p));
+	}
 
 	return success;
 }
@@ -6694,6 +6698,9 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
 
 		trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
+
+		/* GEMVISOR: Trace context switch for divergence debugging */
+		gem_trace_sched_switch(prev->pid, next->pid, prev_state);
 
 		/* Also unlocks the rq: */
 		rq = context_switch(rq, prev, next, &rf);

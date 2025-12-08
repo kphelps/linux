@@ -19,6 +19,7 @@
 #include <asm/cacheflush.h>
 #include <asm/apic.h>
 #include <asm/perf_event.h>
+#include <asm/gemvisor_trace.h>
 
 #include "mm_internal.h"
 
@@ -561,6 +562,10 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 	new_lam = mm_lam_cr3_mask(next);
 	set_tlbstate_lam_mode(next);
+
+	/* GEMVISOR: Trace CR3 switch for divergence debugging */
+	gem_trace_cr3_switch((u64)real_prev->pgd, (u64)next->pgd);
+
 	if (need_flush) {
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
@@ -799,6 +804,10 @@ static void flush_tlb_func(void *info)
 	 */
 	nr_invalidate = TLB_FLUSH_ALL;
 	flush_tlb_local();
+
+	/* GEMVISOR: Trace TLB flush for divergence debugging */
+	gem_trace_tlb_flush(local ? TLB_LOCAL_SHOOTDOWN : TLB_REMOTE_SHOOTDOWN, 0);
+
 	if (local)
 		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
 

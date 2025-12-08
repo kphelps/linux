@@ -1099,6 +1099,7 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_apic_timer_interrupt)
 	gem_trace_timer_fire(LOCAL_TIMER_VECTOR);
 
 	apic_eoi();
+	gem_trace_irq_eoi(LOCAL_TIMER_VECTOR);
 	trace_local_timer_entry(LOCAL_TIMER_VECTOR);
 	local_apic_timer_interrupt();
 	trace_local_timer_exit(LOCAL_TIMER_VECTOR);

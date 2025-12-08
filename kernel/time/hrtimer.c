@@ -47,6 +47,8 @@
 
 #include <trace/events/timer.h>
 
+#include <asm/gemvisor_trace.h>
+
 #include "tick-internal.h"
 
 /*
@@ -1305,6 +1307,9 @@ void hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 	if (__hrtimer_start_range_ns(timer, tim, delta_ns, mode, base))
 		hrtimer_reprogram(timer, true);
 
+	/* GEMVISOR: Trace hrtimer start for divergence debugging */
+	gem_trace_hrtimer_start(ktime_to_ns(tim));
+
 	unlock_hrtimer_base(timer, &flags);
 }
 EXPORT_SYMBOL_GPL(hrtimer_start_range_ns);
@@ -1752,6 +1757,9 @@ static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now,
 			 */
 			if (basenow < hrtimer_get_softexpires_tv64(timer))
 				break;
+
+			/* GEMVISOR: Trace hrtimer expire for divergence debugging */
+			gem_trace_hrtimer_expire(timer);
 
 			__run_hrtimer(cpu_base, base, timer, &basenow, flags);
 			if (active_mask == HRTIMER_ACTIVE_SOFT)

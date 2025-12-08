@@ -29,6 +29,7 @@
 #include <linux/wait_bit.h>
 
 #include <asm/softirq_stack.h>
+#include <asm/gemvisor_trace.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/irq.h>
@@ -550,7 +551,9 @@ restart:
 		kstat_incr_softirqs_this_cpu(vec_nr);
 
 		trace_softirq_entry(vec_nr);
+		gem_trace_softirq_entry(vec_nr);
 		h->action(h);
+		gem_trace_softirq_exit(vec_nr);
 		trace_softirq_exit(vec_nr);
 		if (unlikely(prev_count != preempt_count())) {
 			pr_err("huh, entered softirq %u %s %p with preempt_count %08x, exited with %08x?\n",
