@@ -244,15 +244,19 @@ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
-	 * Always call clear_asid_other() unconditionally instead of checking
-	 * cpu_tlbstate.invalidate_other. The conditional causes different
-	 * instruction counts when invalidate_other differs between VMs.
+	 * Call clear_asid_other() if PTI is enabled, otherwise skip it.
+	 * The original code checked cpu_tlbstate.invalidate_other, but that
+	 * conditional causes different instruction counts between VMs.
 	 *
-	 * clear_asid_other() is safe to call when invalidate_other is false -
-	 * it just clears ASID context entries and sets the flag to false,
-	 * which is a no-op if already false.
+	 * We must check PTI because clear_asid_other() has a WARN_ON_ONCE
+	 * when called without PTI enabled. Without PTI, clearing ASID context
+	 * entries is unnecessary anyway since global pages exist.
+	 *
+	 * The static_cpu_has() check is resolved at boot time, so this is
+	 * still deterministic - both VMs will take the same branch.
 	 */
-	clear_asid_other();
+	if (static_cpu_has(X86_FEATURE_PTI))
+		clear_asid_other();
 
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
