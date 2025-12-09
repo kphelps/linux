@@ -16,8 +16,8 @@
 #include <linux/stacktrace.h>
 #include <asm/early_ioremap.h>
 #include <asm/gemvisor_trace.h>
-#include <asm/kvmclock.h>
 #include <asm/pvclock.h>
+#include <asm/kvmclock.h>
 #include <asm/processor.h>
 
 #define MIN_EVENT_SIZE 32
