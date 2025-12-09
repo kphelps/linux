@@ -45,10 +45,19 @@
 #define GEM_EVT_SCHED_SWITCH       0x3001
 #define GEM_EVT_SCHED_WAKEUP       0x3002
 
+/* Event types - Syscall (0x50xx) */
+#define GEM_EVT_SYSCALL_ENTER      0x5001
+#define GEM_EVT_SYSCALL_EXIT       0x5002
+
 /* Event types - Control (0xF0xx) */
 #define GEM_EVT_MILESTONE          0xF001
 #define GEM_EVT_BUFFER_WRAP        0xF002
 #define GEM_EVT_FLUSH_REQ          0xF003
+
+/* Syscall ABI identifiers */
+#define GEM_SYSCALL_ABI_X64        1
+#define GEM_SYSCALL_ABI_X32        2
+#define GEM_SYSCALL_ABI_IA32       3
 
 /* Trace header structure (64 bytes) */
 struct gem_trace_header {
@@ -161,6 +170,19 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 #define gem_trace_hrtimer_cancel(timer_addr) do { \
 	u64 _a = (u64)(timer_addr); \
 	gemvisor_trace_emit(GEM_EVT_HRTIMER_CANCEL, 0, &_a, sizeof(_a)); \
+} while (0)
+
+/* Syscall trace helpers */
+#define gem_trace_syscall_enter(nr, abi) do { \
+	struct { __u32 nr; __u8 abi; __u8 _pad[3]; } __packed _pl = { \
+		(__u32)(nr), (__u8)(abi), { 0, 0, 0 } }; \
+	gemvisor_trace_emit(GEM_EVT_SYSCALL_ENTER, 0, &_pl, sizeof(_pl)); \
+} while (0)
+
+#define gem_trace_syscall_exit(nr, abi, ret) do { \
+	struct { __u32 nr; __u8 abi; __u8 _pad[3]; __s64 ret; } __packed _pl = { \
+		(__u32)(nr), (__u8)(abi), { 0, 0, 0 }, (__s64)(ret) }; \
+	gemvisor_trace_emit(GEM_EVT_SYSCALL_EXIT, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
 #endif /* _ASM_X86_GEMVISOR_TRACE_H */

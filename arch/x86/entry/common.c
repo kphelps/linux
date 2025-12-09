@@ -33,6 +33,7 @@
 #include <asm/fpu/api.h>
 #include <asm/nospec-branch.h>
 #include <asm/io_bitmap.h>
+#include <asm/gemvisor_trace.h>
 #include <asm/syscall.h>
 #include <asm/irq_stack.h>
 
@@ -48,7 +49,9 @@ static __always_inline bool do_syscall_x64(struct pt_regs *regs, int nr)
 
 	if (likely(unr < NR_syscalls)) {
 		unr = array_index_nospec(unr, NR_syscalls);
+		gem_trace_syscall_enter(unr, GEM_SYSCALL_ABI_X64);
 		regs->ax = x64_sys_call(regs, unr);
+		gem_trace_syscall_exit(unr, GEM_SYSCALL_ABI_X64, regs->ax);
 		return true;
 	}
 	return false;
@@ -65,7 +68,9 @@ static __always_inline bool do_syscall_x32(struct pt_regs *regs, int nr)
 
 	if (IS_ENABLED(CONFIG_X86_X32_ABI) && likely(xnr < X32_NR_syscalls)) {
 		xnr = array_index_nospec(xnr, X32_NR_syscalls);
+		gem_trace_syscall_enter(xnr, GEM_SYSCALL_ABI_X32);
 		regs->ax = x32_sys_call(regs, xnr);
+		gem_trace_syscall_exit(xnr, GEM_SYSCALL_ABI_X32, regs->ax);
 		return true;
 	}
 	return false;
@@ -80,7 +85,9 @@ __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
 
 	if (!do_syscall_x64(regs, nr) && !do_syscall_x32(regs, nr) && nr != -1) {
 		/* Invalid system call, but still a system call. */
+		gem_trace_syscall_enter((unsigned int)nr, GEM_SYSCALL_ABI_X64);
 		regs->ax = __x64_sys_ni_syscall(regs);
+		gem_trace_syscall_exit((unsigned int)nr, GEM_SYSCALL_ABI_X64, regs->ax);
 	}
 
 	instrumentation_end();
@@ -114,9 +121,13 @@ static __always_inline void do_syscall_32_irqs_on(struct pt_regs *regs, int nr)
 
 	if (likely(unr < IA32_NR_syscalls)) {
 		unr = array_index_nospec(unr, IA32_NR_syscalls);
+		gem_trace_syscall_enter(unr, GEM_SYSCALL_ABI_IA32);
 		regs->ax = ia32_sys_call(regs, unr);
+		gem_trace_syscall_exit(unr, GEM_SYSCALL_ABI_IA32, regs->ax);
 	} else if (nr != -1) {
+		gem_trace_syscall_enter((unsigned int)nr, GEM_SYSCALL_ABI_IA32);
 		regs->ax = __ia32_sys_ni_syscall(regs);
+		gem_trace_syscall_exit((unsigned int)nr, GEM_SYSCALL_ABI_IA32, regs->ax);
 	}
 }
 
