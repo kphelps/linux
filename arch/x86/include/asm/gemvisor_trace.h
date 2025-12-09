@@ -137,23 +137,26 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 } while (0)
 
 #define gem_trace_tlb_flush(reason, addr) do { \
-	struct { u8 reason; u64 addr; } __packed _pl = { (reason), (addr) }; \
+	struct { u8 reason_field; u64 addr_field; } __packed _pl = { \
+		.reason_field = (u8)(reason), .addr_field = (u64)(addr) }; \
 	gemvisor_trace_emit(GEM_EVT_TLB_FLUSH, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
 #define gem_trace_cr3_switch(old_cr3, new_cr3) do { \
-	struct { u64 old; u64 new; } __packed _pl = { (old_cr3), (new_cr3) }; \
+	struct { u64 old_field; u64 new_field; } __packed _pl = { \
+		.old_field = (u64)(old_cr3), .new_field = (u64)(new_cr3) }; \
 	gemvisor_trace_emit(GEM_EVT_CR3_SWITCH, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
 #define gem_trace_sched_switch(prev_pid, next_pid, prev_state) do { \
-	struct { u32 prev; u32 next; u8 state; } __packed _pl = { \
-		(prev_pid), (next_pid), (prev_state) }; \
+	struct { u32 prev_field; u32 next_field; u8 state_field; } __packed _pl = { \
+		.prev_field = (u32)(prev_pid), .next_field = (u32)(next_pid), .state_field = (u8)(prev_state) }; \
 	gemvisor_trace_emit(GEM_EVT_SCHED_SWITCH, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
 #define gem_trace_sched_wakeup(pid, cpu) do { \
-	struct { u32 pid; u8 cpu; } __packed _pl = { (pid), (cpu) }; \
+	struct { u32 pid_field; u8 cpu_field; } __packed _pl = { \
+		.pid_field = (u32)(pid), .cpu_field = (u8)(cpu) }; \
 	gemvisor_trace_emit(GEM_EVT_SCHED_WAKEUP, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
@@ -173,15 +176,15 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 } while (0)
 
 /* Syscall trace helpers */
-#define gem_trace_syscall_enter(nr, abi) do { \
-	struct { __u32 nr; __u8 abi; __u8 _pad[3]; } __packed _pl = { \
-		(__u32)(nr), (__u8)(abi), { 0, 0, 0 } }; \
+#define gem_trace_syscall_enter(nr, abi_tag) do { \
+	struct { __u32 nr_field; __u8 abi_field; __u8 _pad[3]; } __packed _pl = { \
+		.nr_field = (__u32)(nr), .abi_field = (__u8)(abi_tag), ._pad = { 0, 0, 0 } }; \
 	gemvisor_trace_emit(GEM_EVT_SYSCALL_ENTER, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
-#define gem_trace_syscall_exit(nr, abi, ret) do { \
-	struct { __u32 nr; __u8 abi; __u8 _pad[3]; __s64 ret; } __packed _pl = { \
-		(__u32)(nr), (__u8)(abi), { 0, 0, 0 }, (__s64)(ret) }; \
+#define gem_trace_syscall_exit(nr, abi_tag, ret) do { \
+	struct { __u32 nr_field; __u8 abi_field; __u8 _pad[3]; __s64 ret_field; } __packed _pl = { \
+		.nr_field = (__u32)(nr), .abi_field = (__u8)(abi_tag), ._pad = { 0, 0, 0 }, .ret_field = (__s64)(ret) }; \
 	gemvisor_trace_emit(GEM_EVT_SYSCALL_EXIT, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
