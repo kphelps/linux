@@ -11,15 +11,17 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/string.h>
+#include <linux/panic.h>
 #include <asm/early_ioremap.h>
 #include <asm/gemvisor_trace.h>
+#include <asm/processor.h>
 
-#define RING_BUFFER_SIZE (GEMVISOR_TRACE_PAGE_SIZE - GEMVISOR_TRACE_HEADER_SIZE)
 #define MIN_EVENT_SIZE 32
 
 static struct gem_trace_header __iomem *trace_header;
 static void __iomem *trace_buffer;
 static bool trace_enabled;
+static u32 ring_buffer_size = GEMVISOR_TRACE_PAGE_SIZE - GEMVISOR_TRACE_HEADER_SIZE;
 
 /* I/O port for trace hypercalls (KVM reliably forwards I/O to userspace) */
 #define GEMVISOR_TRACE_PORT	0x512
@@ -54,6 +56,9 @@ void __init gemvisor_trace_init(void)
 	 */
 	trace_header = (struct gem_trace_header __iomem *)ptr;
 	trace_buffer = (void __iomem *)trace_header + GEMVISOR_TRACE_HEADER_SIZE;
+	ring_buffer_size = readl(&trace_header->ring_size);
+	if (!ring_buffer_size)
+		ring_buffer_size = GEMVISOR_TRACE_PAGE_SIZE - GEMVISOR_TRACE_HEADER_SIZE;
 
 	/* Initialize hypervisor trace subsystem via I/O port */
 	outl(TRACE_CMD_INIT, GEMVISOR_TRACE_PORT);
@@ -67,6 +72,7 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 {
 	struct gem_trace_event evt;
 	u32 write_ptr, event_size, avail;
+	unsigned int flush_tries = 0;
 
 	if (!trace_enabled || !trace_header)
 		return;
@@ -74,6 +80,9 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 	/* Calculate event size (32-byte header + payload, aligned to 8 bytes) */
 	event_size = MIN_EVENT_SIZE + payload_len;
 	event_size = (event_size + 7) & ~7;
+
+	if (event_size > ring_buffer_size)
+		panic("gemvisor-trace: event larger than trace ring");
 
 	if (event_size > 128) {
 		/* Limit event size to prevent buffer overflow */
@@ -83,13 +92,24 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 	/* Read current write pointer */
 	write_ptr = readl(&trace_header->write_ptr);
 
-	/* Check if we need to wrap */
-	avail = RING_BUFFER_SIZE - write_ptr;
-	if (avail < event_size) {
-		/* Wrap to start */
+	while (1) {
+		avail = ring_buffer_size - write_ptr;
+		if (avail >= event_size)
+			break;
+
+		/* Buffer is full: ask host to drain and force a VM-exit. */
+		outl(TRACE_CMD_FLUSH, GEMVISOR_TRACE_PORT);
+		asm volatile("vmcall" ::: "memory");
+
+		/* After a flush we start a new ring lap to avoid overwrite without wrap. */
 		writel(0, &trace_header->write_ptr);
 		write_ptr = 0;
 		writel(readl(&trace_header->wrap_count) + 1, &trace_header->wrap_count);
+
+		flush_tries++;
+		if (flush_tries > 1) {
+			panic("gemvisor-trace: host failed to drain trace buffer after flush");
+		}
 	}
 
 	/* Build event header */
