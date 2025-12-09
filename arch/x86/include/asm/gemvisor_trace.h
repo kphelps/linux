@@ -16,6 +16,10 @@
 #define GEMVISOR_TRACE_MAGIC       0x47454D54  /* "GEMT" */
 #define GEMVISOR_TRACE_HEADER_SIZE 64
 
+/* Payload format */
+#define GEM_TRACE_PAYLOAD_VERSION  1
+#define GEM_TRACE_MAX_STACK_DEPTH  8
+
 /* Hypercall numbers */
 #define GEMVISOR_HC_TRACE_INIT     0x47454D03
 #define GEMVISOR_HC_TRACE_FLUSH    0x47454D02
@@ -82,6 +86,14 @@ struct gem_trace_event {
 	__u64 retired;
 	__u64 rip;
 	__u8 payload[];
+} __packed;
+
+/* Payload header for structured guest events */
+struct gem_trace_payload_hdr {
+	__u8 version;      /* GEM_TRACE_PAYLOAD_VERSION */
+	__u8 body_len;     /* Length of event-specific payload (bytes) */
+	__u8 stack_depth;  /* Number of captured stack frames */
+	__u8 reserved;
 } __packed;
 
 /* Initialize the gemvisor trace subsystem (call early in boot) */

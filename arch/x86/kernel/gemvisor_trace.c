@@ -13,8 +13,11 @@
 #include <linux/io.h>
 #include <linux/string.h>
 #include <linux/panic.h>
+#include <linux/stacktrace.h>
 #include <asm/early_ioremap.h>
 #include <asm/gemvisor_trace.h>
+#include <asm/kvmclock.h>
+#include <asm/pvclock.h>
 #include <asm/processor.h>
 
 #define MIN_EVENT_SIZE 32
@@ -31,6 +34,34 @@ static u32 ring_buffer_size = GEMVISOR_TRACE_PAGE_SIZE - GEMVISOR_TRACE_HEADER_S
 /* Trace hypercall commands */
 #define TRACE_CMD_INIT		1
 #define TRACE_CMD_FLUSH		2
+
+static u64 gem_trace_read_vtime(void)
+{
+	struct pvclock_vsyscall_time_info *hvclock = this_cpu_hvclock();
+
+	if (!hvclock)
+		return 0;
+
+	return pvclock_clocksource_read_nowd(&hvclock->pvti);
+}
+
+static u8 gem_trace_capture_stack(u64 *out, u8 max_depth)
+{
+	unsigned long entries[GEM_TRACE_MAX_STACK_DEPTH];
+	unsigned int depth;
+	u8 i, clamped_depth;
+
+	if (max_depth > GEM_TRACE_MAX_STACK_DEPTH)
+		max_depth = GEM_TRACE_MAX_STACK_DEPTH;
+
+	depth = stack_trace_save(entries, max_depth, 2);
+	clamped_depth = depth > max_depth ? max_depth : depth;
+
+	for (i = 0; i < clamped_depth; i++)
+		out[i] = entries[i];
+
+	return clamped_depth;
+}
 
 void __init gemvisor_trace_init(void)
 {
@@ -99,9 +130,14 @@ core_initcall(gemvisor_trace_remap);
 void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payload_len)
 {
 	struct gem_trace_event evt;
+	struct gem_trace_payload_hdr payload_hdr;
+	u64 stack_entries[GEM_TRACE_MAX_STACK_DEPTH];
 	u32 write_ptr, event_size, avail;
+	u32 payload_total;
+	u8 stack_depth;
 	unsigned int flush_tries = 0;
 	unsigned long irq_flags;
+	u64 vtime_ns;
 
 	if (!trace_enabled || !trace_header)
 		return;
@@ -109,11 +145,21 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 	/* Prevent IRQ handlers from interleaving writes into the trace ring */
 	local_irq_save(irq_flags);
 
-	/* Calculate event size (32-byte header + payload, aligned to 8 bytes) */
-	event_size = MIN_EVENT_SIZE + payload_len;
+	vtime_ns = gem_trace_read_vtime();
+	stack_depth = gem_trace_capture_stack(stack_entries, GEM_TRACE_MAX_STACK_DEPTH);
+
+	payload_hdr.version = GEM_TRACE_PAYLOAD_VERSION;
+	payload_hdr.body_len = payload_len;
+	payload_hdr.stack_depth = stack_depth;
+	payload_hdr.reserved = 0;
+
+	/* Calculate event size (header + payload header + body + stack frames), aligned to 8 bytes */
+	payload_total = sizeof(payload_hdr) + payload_len +
+		(u32)stack_depth * (u32)sizeof(u64);
+	event_size = MIN_EVENT_SIZE + payload_total;
 	event_size = (event_size + 7) & ~7;
 
-	if (event_size > ring_buffer_size) {
+	if (event_size > ring_buffer_size || event_size > 255) {
 		local_irq_restore(irq_flags);
 		panic("gemvisor-trace: event larger than trace ring");
 	}
@@ -155,16 +201,32 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 	evt.type_hi = (event_type >> 8) & 0xFF;
 	evt.type_lo = event_type & 0xFFFF;
 	evt.flags = flags;
-	evt.vtime_ns = 0;  /* Hypervisor fills this from pvclock */
-	evt.retired = 0;   /* Hypervisor fills this from PMC */
+	evt.vtime_ns = vtime_ns;
+	evt.retired = vtime_ns;
 	evt.rip = (u64)__builtin_return_address(0);
 
 	/* Write event header */
 	memcpy_toio(trace_buffer + write_ptr, &evt, MIN_EVENT_SIZE);
 
-	/* Write payload if present */
+	/* Write payload header + body + stack frames */
+	memcpy_toio(trace_buffer + write_ptr + MIN_EVENT_SIZE,
+		    &payload_hdr, sizeof(payload_hdr));
+
 	if (payload_len > 0 && payload != NULL) {
-		memcpy_toio(trace_buffer + write_ptr + MIN_EVENT_SIZE, payload, payload_len);
+		memcpy_toio(trace_buffer + write_ptr + MIN_EVENT_SIZE + sizeof(payload_hdr),
+			    payload, payload_len);
+	}
+
+	if (stack_depth > 0) {
+		memcpy_toio(trace_buffer + write_ptr + MIN_EVENT_SIZE +
+				    sizeof(payload_hdr) + payload_len,
+			    stack_entries, (size_t)stack_depth * sizeof(u64));
+	}
+
+	/* Zero any alignment padding to keep the buffer deterministic */
+	if (event_size > MIN_EVENT_SIZE + payload_total) {
+		memset_io(trace_buffer + write_ptr + MIN_EVENT_SIZE + payload_total, 0,
+			  event_size - (MIN_EVENT_SIZE + payload_total));
 	}
 
 	/* Advance write pointer and sequence */
