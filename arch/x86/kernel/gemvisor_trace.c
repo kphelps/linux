@@ -84,9 +84,11 @@ static struct gem_trace_reg_snapshot gem_trace_collect_regs(struct pt_regs *regs
 	rdmsrl(MSR_KERNEL_GS_BASE, snap.kernel_gs_base);
 	rdmsrl(MSR_FS_BASE, snap.fs_base);
 	snap.cr3 = __read_cr3();
-	snap.xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
-	snap.cr2 = read_cr2();
 	snap.cr4 = __read_cr4();
+	/* XGETBV requires CR4.OSXSAVE (bit 18) to be set */
+	if (snap.cr4 & X86_CR4_OSXSAVE)
+		snap.xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
+	snap.cr2 = read_cr2();
 
 	/* Extract rsp and rflags from pt_regs if available */
 	if (regs) {
