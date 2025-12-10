@@ -150,63 +150,18 @@ static struct gem_trace_reg_snapshot gem_trace_collect_regs(struct pt_regs *regs
 static u8 gem_trace_capture_stack(struct pt_regs *regs, u64 *out, u8 max_depth)
 {
 	unsigned long entries[GEM_TRACE_MAX_STACK_DEPTH] = { 0 };
-	unsigned int depth;
-	u8 i, clamped_depth;
+	u8 depth, i;
 
 	if (max_depth > GEM_TRACE_MAX_STACK_DEPTH)
 		max_depth = GEM_TRACE_MAX_STACK_DEPTH;
 
-	if (regs)
-		depth = stack_trace_save_regs(regs, entries, max_depth, 0);
-	else
-		depth = stack_trace_save(entries, max_depth, 2);
+	/* Simplified and deterministic: frame-pointer walk only. */
+	depth = gem_trace_fp_unwind(regs, entries, max_depth);
 
-	/* If the unwinder returned few frames, append a frame-pointer walk without discarding what we have. */
-	if (depth < 4 && depth < max_depth) {
-		u8 remaining = max_depth - depth;
-		depth += gem_trace_fp_unwind(regs, entries + depth, remaining);
-	}
-
-	/* Final fallback: only if nothing was captured, scan the stack for plausible kernel return addresses. */
-	if (depth == 0) {
-		unsigned long scan = regs ? regs->sp : (unsigned long)__builtin_frame_address(0);
-		unsigned long stack_low = (unsigned long)task_stack_page(current);
-		unsigned long stack_high = stack_low + THREAD_SIZE;
-
-		if (scan < stack_low)
-			scan = stack_low;
-		if (scan > stack_high)
-			scan = stack_high;
-
-		for (; depth < max_depth && scan + sizeof(unsigned long) <= stack_high;
-		     scan += sizeof(unsigned long)) {
-			unsigned long candidate = *(unsigned long *)scan;
-			if (!gem_trace_is_canonical(candidate))
-				continue;
-			if (candidate < PAGE_OFFSET)
-				continue;
-
-			bool dup = false;
-			for (u8 j = 0; j < depth; j++) {
-				if (entries[j] == candidate) {
-					dup = true;
-					break;
-				}
-			}
-			if (dup)
-				continue;
-
-			entries[depth] = candidate;
-			depth++;
-		}
-	}
-
-	clamped_depth = depth > max_depth ? max_depth : depth;
-
-	for (i = 0; i < clamped_depth; i++)
+	for (i = 0; i < depth; i++)
 		out[i] = (u64)entries[i];
 
-	return clamped_depth;
+	return depth;
 }
 
 void __init gemvisor_trace_init(void)
