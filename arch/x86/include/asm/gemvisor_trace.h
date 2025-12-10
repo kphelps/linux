@@ -17,8 +17,13 @@
 #define GEMVISOR_TRACE_HEADER_SIZE 64
 
 /* Payload format */
-#define GEM_TRACE_PAYLOAD_VERSION  1
-#define GEM_TRACE_MAX_STACK_DEPTH  8
+#define GEM_TRACE_PAYLOAD_VERSION  2
+/*
+ * Stack depth and payload sizing are bounded by the u8 event size field.
+ * With a 32-byte header and richer register payloads we cap the depth at 20
+ * to stay < 255 bytes while still capturing meaningful context.
+ */
+#define GEM_TRACE_MAX_STACK_DEPTH  20
 
 /* Hypercall numbers */
 #define GEMVISOR_HC_TRACE_INIT     0x47454D03
@@ -93,7 +98,7 @@ struct gem_trace_payload_hdr {
 	__u8 version;      /* GEM_TRACE_PAYLOAD_VERSION */
 	__u8 body_len;     /* Length of event-specific payload (bytes) */
 	__u8 stack_depth;  /* Number of captured stack frames */
-	__u8 reserved;
+	__u8 reserved;     /* For v2: size in bytes of appended register snapshot */
 } __packed;
 
 /* Initialize the gemvisor trace subsystem (call early in boot) */
@@ -101,6 +106,9 @@ void __init gemvisor_trace_init(void);
 
 /* Emit a trace event (call from anywhere) */
 void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payload_len);
+/* Emit a trace event with explicit pt_regs (preferred when available) */
+void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8 payload_len,
+				 struct pt_regs *regs);
 
 /* Convenience macros for common events */
 #define gem_trace_milestone(id) do { \
@@ -121,6 +129,11 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 #define gem_trace_page_fault(gva, error_code) do { \
 	struct { u64 gva; u32 ec; } __packed _pl = { (gva), (error_code) }; \
 	gemvisor_trace_emit(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl)); \
+} while (0)
+
+#define gem_trace_page_fault_regs(regs, gva, error_code) do { \
+	struct { u64 gva; u32 ec; } __packed _pl = { (gva), (error_code) }; \
+	gemvisor_trace_emit_regs(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl), (regs)); \
 } while (0)
 
 #define gem_trace_irq_entry(vector) do { \

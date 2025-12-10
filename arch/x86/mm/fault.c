@@ -1496,7 +1496,7 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 	irqentry_state_t state;
 
 	/* Gemvisor trace: page fault entry with address and error code */
-	gem_trace_page_fault(address, error_code);
+	gem_trace_page_fault_regs(regs, address, error_code);
 
 	prefetchw(&current->mm->mmap_lock);
 
