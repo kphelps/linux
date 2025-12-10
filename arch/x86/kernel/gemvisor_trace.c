@@ -107,6 +107,10 @@ static u8 gem_trace_capture_stack(struct pt_regs *regs, u64 *out, u8 max_depth)
 	else
 		depth = stack_trace_save(entries, max_depth, 0);
 
+	/* Fallback: if unwinder returned very few frames (common on user faults), grab current kernel stack. */
+	if (depth < 4)
+		depth = stack_trace_save(entries, max_depth, 1); /* skip this helper frame */
+
 	for (i = 0; i < depth; i++)
 		out[i] = (u64)entries[i];
 

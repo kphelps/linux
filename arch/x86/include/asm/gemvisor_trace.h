@@ -17,7 +17,7 @@
 #define GEMVISOR_TRACE_HEADER_SIZE 64
 
 /* Payload format */
-#define GEM_TRACE_PAYLOAD_VERSION  2
+#define GEM_TRACE_PAYLOAD_VERSION  3
 /*
  * Stack depth and payload sizing are bounded by the u8 event size field.
  * With a 32-byte header and richer register payloads we cap the depth at 20
@@ -127,12 +127,14 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 } while (0)
 
 #define gem_trace_page_fault(gva, error_code) do { \
-	struct { u64 gva; u32 ec; } __packed _pl = { (gva), (error_code) }; \
+	struct { u64 gva; u32 ec; u64 rip; } __packed _pl = { \
+		(gva), (error_code), (u64)__builtin_return_address(0) }; \
 	gemvisor_trace_emit(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
 #define gem_trace_page_fault_regs(regs, gva, error_code) do { \
-	struct { u64 gva; u32 ec; } __packed _pl = { (gva), (error_code) }; \
+	struct { u64 gva; u32 ec; u64 rip; } __packed _pl = { \
+		(gva), (error_code), (regs) ? (u64)(regs)->ip : 0 }; \
 	gemvisor_trace_emit_regs(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl), (regs)); \
 } while (0)
 
