@@ -14,7 +14,6 @@
 #include <linux/string.h>
 #include <linux/panic.h>
 #include <linux/stacktrace.h>
-#include <linux/sched/task_stack.h>
 #include <asm/early_ioremap.h>
 #include <asm/gemvisor_trace.h>
 #include <asm/irq_regs.h>
@@ -73,59 +72,6 @@ static u64 gem_trace_fnv64(const void *data, size_t len)
 	return hash;
 }
 
-static bool gem_trace_is_canonical(unsigned long addr)
-{
-	unsigned long sign = addr >> 47;
-	return sign == 0 || sign == 0x1ffff;
-}
-
-static u8 gem_trace_fp_unwind(struct pt_regs *regs, unsigned long *out, u8 max_depth)
-{
-	unsigned long rbp;
-	unsigned long sp;
-
-	if (regs) {
-		rbp = regs->bp;
-		sp = regs->sp;
-	} else {
-		rbp = (unsigned long)__builtin_frame_address(0);
-		sp = (unsigned long)__builtin_frame_address(0);
-	}
-
-	if (!max_depth)
-		return 0;
-
-	const unsigned long stack_low = (unsigned long)task_stack_page(current);
-	const unsigned long stack_high = stack_low + THREAD_SIZE;
-	unsigned long next_rbp = rbp;
-	u8 depth = 0;
-
-	while (depth < max_depth) {
-		unsigned long curr_rbp = next_rbp;
-		if (curr_rbp < stack_low + sizeof(unsigned long) ||
-		    curr_rbp + 16 > stack_high ||
-		    curr_rbp & 0x7)
-			break;
-
-		next_rbp = *(unsigned long *)curr_rbp;
-		unsigned long ret = *(unsigned long *)(curr_rbp + sizeof(unsigned long));
-
-		if (!gem_trace_is_canonical(ret))
-			break;
-		if (ret < PAGE_OFFSET) /* user address */
-			break;
-
-		out[depth++] = ret;
-
-		if (next_rbp <= curr_rbp || next_rbp >= stack_high)
-			break;
-		if (next_rbp < sp) /* walked past current frame */
-			break;
-	}
-
-	return depth;
-}
-
 static struct gem_trace_reg_snapshot gem_trace_collect_regs(struct pt_regs *regs)
 {
 	struct gem_trace_reg_snapshot snap = { 0 };
@@ -155,8 +101,11 @@ static u8 gem_trace_capture_stack(struct pt_regs *regs, u64 *out, u8 max_depth)
 	if (max_depth > GEM_TRACE_MAX_STACK_DEPTH)
 		max_depth = GEM_TRACE_MAX_STACK_DEPTH;
 
-	/* Simplified and deterministic: frame-pointer walk only. */
-	depth = gem_trace_fp_unwind(regs, entries, max_depth);
+	/* Prefer kernel-provided unwinders for consistency with stacktrace.h helpers. */
+	if (regs)
+		depth = stack_trace_save_regs(regs, entries, max_depth, 0);
+	else
+		depth = stack_trace_save(entries, max_depth, 0);
 
 	for (i = 0; i < depth; i++)
 		out[i] = (u64)entries[i];
