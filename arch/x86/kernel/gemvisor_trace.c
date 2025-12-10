@@ -14,6 +14,9 @@
 #include <linux/string.h>
 #include <linux/panic.h>
 #include <linux/stacktrace.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+#include <linux/mm_types.h>
 #include <asm/early_ioremap.h>
 #include <asm/gemvisor_trace.h>
 #include <asm/irq_regs.h>
@@ -22,6 +25,8 @@
 #include <asm/kvmclock.h>
 #include <asm/processor.h>
 #include <asm/fpu/xcr.h>
+#include <asm/pgtable.h>
+#include <asm/pgtable_types.h>
 
 #define MIN_EVENT_SIZE 32
 
@@ -322,9 +327,113 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 }
 EXPORT_SYMBOL_GPL(gemvisor_trace_emit_regs);
 
-/* Backward-compatible shim when callers don’t have pt_regs handy. */
+/* Backward-compatible shim when callers don't have pt_regs handy. */
 void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payload_len)
 {
 	gemvisor_trace_emit_regs(event_type, flags, payload, payload_len, NULL);
 }
 EXPORT_SYMBOL_GPL(gemvisor_trace_emit);
+
+/*
+ * Collect extended page fault context for debugging.
+ *
+ * This function attempts to gather VMA and PTE information at the time of
+ * a page fault. It uses lockless/speculative reads where possible to avoid
+ * deadlocks or sleeping in the fault path.
+ *
+ * Note: VMA info may be stale or unavailable if we can't safely read it.
+ * PTE walk is lockless but may race with concurrent modifications.
+ */
+void gem_trace_collect_pf_context(struct gem_pf_payload *pl, unsigned long address,
+				  struct pt_regs *regs)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	/* Always capture PID */
+	pl->pid = current->pid;
+
+	/* Initialize extended fields to zero (no info available) */
+	pl->vm_start = 0;
+	pl->vm_end = 0;
+	pl->vm_flags = 0;
+	pl->pte_val = 0;
+
+	/*
+	 * Try to get VMA info. We use a speculative read approach:
+	 * - Check if we have an mm
+	 * - Try lock_vma_under_rcu if CONFIG_PER_VMA_LOCK is enabled
+	 * - Otherwise skip VMA info (too risky to take mmap lock here)
+	 */
+	mm = current->mm;
+	if (!mm)
+		goto walk_pte;
+
+	/*
+	 * Try RCU-protected VMA lookup if available.
+	 * This is safe in the fault path and doesn't sleep.
+	 */
+	vma = lock_vma_under_rcu(mm, address);
+	if (vma) {
+		pl->vm_start = vma->vm_start;
+		pl->vm_end = vma->vm_end;
+		pl->vm_flags = vma->vm_flags;
+		vma_end_read(vma);
+	}
+
+walk_pte:
+	/*
+	 * Walk the page table to get PTE value.
+	 * This is a lockless read - the PTE may change concurrently,
+	 * but we capture a snapshot for debugging purposes.
+	 *
+	 * For user addresses, use the mm's pgd; for kernel addresses,
+	 * use the kernel's pgd.
+	 */
+	if (address >= TASK_SIZE) {
+		/* Kernel address - use kernel page tables */
+		pgd = pgd_offset_k(address);
+	} else if (mm) {
+		/* User address - use process page tables */
+		pgd = pgd_offset(mm, address);
+	} else {
+		return;
+	}
+
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return;
+
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return;
+
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return;
+
+	/* Check for huge page at PUD level */
+	if (pud_large(*pud)) {
+		pl->pte_val = pud_val(*pud);
+		return;
+	}
+
+	pmd = pmd_offset(pud, address);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return;
+
+	/* Check for huge page at PMD level */
+	if (pmd_large(*pmd)) {
+		pl->pte_val = pmd_val(*pmd);
+		return;
+	}
+
+	pte = pte_offset_kernel(pmd, address);
+	if (pte)
+		pl->pte_val = pte_val(*pte);
+}
+EXPORT_SYMBOL_GPL(gem_trace_collect_pf_context);

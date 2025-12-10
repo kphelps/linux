@@ -129,16 +129,45 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 	gemvisor_trace_emit(GEM_EVT_TIMER_FIRE, 0, &_v, sizeof(_v)); \
 } while (0)
 
-#define gem_trace_page_fault(gva, error_code) do { \
-	struct { u64 gva; u32 ec; u64 rip; } __packed _pl = { \
-		(gva), (error_code), (u64)__builtin_return_address(0) }; \
+/*
+ * Extended page fault payload with VMA and PTE context for debugging.
+ * Total: 20 bytes (original) + 36 bytes (new) = 56 bytes
+ */
+struct gem_pf_payload {
+	/* Original fields */
+	__u64 gva;		/* Faulting guest virtual address */
+	__u32 error_code;	/* x86 page fault error code */
+	__u64 rip;		/* Instruction pointer that caused fault */
+	/* Extended fields for root cause analysis */
+	__u64 vm_start;		/* VMA start (0 if no VMA found) */
+	__u64 vm_end;		/* VMA end (0 if no VMA found) */
+	__u64 vm_flags;		/* VMA flags (VM_READ|VM_WRITE|VM_EXEC|...) */
+	__u64 pte_val;		/* PTE value at fault address (0 if walk failed) */
+	__u32 pid;		/* current->pid */
+} __packed;
+
+/* Helper to collect extended page fault info - implemented in gemvisor_trace.c */
+void gem_trace_collect_pf_context(struct gem_pf_payload *pl, unsigned long address,
+				  struct pt_regs *regs);
+
+#define gem_trace_page_fault(_gva, _ec) do { \
+	struct gem_pf_payload _pl = { \
+		.gva = (_gva), \
+		.error_code = (_ec), \
+		.rip = (u64)__builtin_return_address(0), \
+	}; \
+	gem_trace_collect_pf_context(&_pl, (_gva), NULL); \
 	gemvisor_trace_emit(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
-#define gem_trace_page_fault_regs(regs, gva, error_code) do { \
-	struct { u64 gva; u32 ec; u64 rip; } __packed _pl = { \
-		(gva), (error_code), (regs) ? (u64)(regs)->ip : 0 }; \
-	gemvisor_trace_emit_regs(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl), (regs)); \
+#define gem_trace_page_fault_regs(_regs, _gva, _ec) do { \
+	struct gem_pf_payload _pl = { \
+		.gva = (_gva), \
+		.error_code = (_ec), \
+		.rip = (_regs) ? (u64)(_regs)->ip : 0, \
+	}; \
+	gem_trace_collect_pf_context(&_pl, (_gva), (_regs)); \
+	gemvisor_trace_emit_regs(GEM_EVT_PAGE_FAULT, 0, &_pl, sizeof(_pl), (_regs)); \
 } while (0)
 
 #define gem_trace_irq_entry(vector) do { \
