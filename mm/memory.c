@@ -86,6 +86,7 @@
 #include <linux/uaccess.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
+#include <asm/gemvisor_trace.h>
 
 #include "pgalloc-track.h"
 #include "internal.h"
@@ -3197,6 +3198,10 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		}
 
 		/* Free the old page.. */
+		/* Trace CoW completion for determinism debugging (capture new PFN before reassignment) */
+		gem_trace_cow_fault(vmf->address,
+				    pte_pfn(vmf->orig_pte),
+				    pte_pfn(entry));
 		new_folio = old_folio;
 		page_copied = 1;
 		pte_unmap_unlock(vmf->pte, vmf->ptl);

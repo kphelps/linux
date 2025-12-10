@@ -16,6 +16,7 @@
 #include <linux/errno.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
+#include <asm/gemvisor_trace.h>
 
 #if 5 - defined(__PAGETABLE_P4D_FOLDED) - defined(__PAGETABLE_PUD_FOLDED) - \
 	defined(__PAGETABLE_PMD_FOLDED) != CONFIG_PGTABLE_LEVELS
@@ -231,14 +232,18 @@ static inline pte_t pte_next_pfn(pte_t pte)
 static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
 		pte_t *ptep, pte_t pte, unsigned int nr)
 {
+	unsigned long cur_addr = addr;
+
 	page_table_check_ptes_set(mm, ptep, pte, nr);
 
 	arch_enter_lazy_mmu_mode();
 	for (;;) {
+		gem_trace_pte_modify(cur_addr, pte_val(*ptep), pte_val(pte));
 		set_pte(ptep, pte);
 		if (--nr == 0)
 			break;
 		ptep++;
+		cur_addr += PAGE_SIZE;
 		pte = pte_next_pfn(pte);
 	}
 	arch_leave_lazy_mmu_mode();

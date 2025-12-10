@@ -42,6 +42,9 @@
 #define GEM_EVT_TLB_FLUSH          0x1002
 #define GEM_EVT_CR3_SWITCH         0x1003
 #define GEM_EVT_SPURIOUS_FAULT     0x1004
+#define GEM_EVT_PTE_MODIFY         0x1005  /* PTE permission/presence change */
+#define GEM_EVT_COW_FAULT          0x1006  /* Copy-on-write page copy */
+#define GEM_EVT_DO_WP_PAGE         0x1007  /* Write-protect fault handling entry */
 
 /* Event types - Interrupt (0x20xx) */
 #define GEM_EVT_IRQ_ENTRY          0x2001
@@ -213,6 +216,29 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 	struct { __u32 nr_field; __u8 abi_field; __u8 _pad[3]; __s64 ret_field; } __packed _pl = { \
 		.nr_field = (__u32)(nr), .abi_field = (__u8)(abi_tag), ._pad = { 0, 0, 0 }, .ret_field = (__s64)(ret) }; \
 	gemvisor_trace_emit(GEM_EVT_SYSCALL_EXIT, 0, &_pl, sizeof(_pl)); \
+} while (0)
+
+/* PTE modification tracing for determinism debugging */
+#define gem_trace_pte_modify(gva, old_pte, new_pte) do { \
+	struct { u64 gva_field; u64 old_pte_field; u64 new_pte_field; } __packed _pl = { \
+		.gva_field = (u64)(gva), .old_pte_field = (u64)(old_pte), \
+		.new_pte_field = (u64)(new_pte) }; \
+	gemvisor_trace_emit(GEM_EVT_PTE_MODIFY, 0, &_pl, sizeof(_pl)); \
+} while (0)
+
+/* Copy-on-write fault tracing */
+#define gem_trace_cow_fault(addr, old_pfn, new_pfn) do { \
+	struct { u64 addr_field; u64 old_pfn_field; u64 new_pfn_field; } __packed _pl = { \
+		.addr_field = (u64)(addr), .old_pfn_field = (u64)(old_pfn), \
+		.new_pfn_field = (u64)(new_pfn) }; \
+	gemvisor_trace_emit(GEM_EVT_COW_FAULT, 0, &_pl, sizeof(_pl)); \
+} while (0)
+
+/* Write-protect page fault entry tracing (with registers) */
+#define gem_trace_do_wp_page(regs, vmf_addr, vmf_flags) do { \
+	struct { u64 addr_field; u32 flags_field; } __packed _pl = { \
+		.addr_field = (u64)(vmf_addr), .flags_field = (u32)(vmf_flags) }; \
+	gemvisor_trace_emit_regs(GEM_EVT_DO_WP_PAGE, 0, &_pl, sizeof(_pl), (regs)); \
 } while (0)
 
 #endif /* _ASM_X86_GEMVISOR_TRACE_H */

@@ -44,6 +44,10 @@ struct gem_trace_reg_snapshot {
 	u64 fs_base;
 	u64 cr3;
 	u64 xcr0;
+	u64 cr2;		/* Fault linear address */
+	u64 cr4;		/* PCID, SMEP, SMAP flags */
+	u64 rsp;		/* Stack pointer from pt_regs */
+	u64 rflags;		/* Flags from pt_regs */
 	u64 hash;
 } __packed;
 
@@ -81,6 +85,14 @@ static struct gem_trace_reg_snapshot gem_trace_collect_regs(struct pt_regs *regs
 	rdmsrl(MSR_FS_BASE, snap.fs_base);
 	snap.cr3 = __read_cr3();
 	snap.xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
+	snap.cr2 = read_cr2();
+	snap.cr4 = __read_cr4();
+
+	/* Extract rsp and rflags from pt_regs if available */
+	if (regs) {
+		snap.rsp = regs->sp;
+		snap.rflags = regs->flags;
+	}
 
 	/*
 	 * Hash the pt_regs (when available) together with the raw register snapshot
