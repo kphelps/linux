@@ -20,7 +20,6 @@
 #include <linux/efi.h>			/* efi_crash_gracefully_on_page_fault()*/
 #include <linux/mm_types.h>
 #include <linux/mm.h>			/* find_and_lock_vma() */
-#include <linux/io.h>			/* outl() for gemvisor tracing */
 
 #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
 #include <asm/traps.h>			/* dotraplinkage, ...		*/
@@ -39,13 +38,6 @@
 
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
-
-/*
- * IO port for signaling spurious kernel faults to the hypervisor.
- * The hypervisor can log these events for determinism debugging.
- * Format: low 32 bits = faulting address, write triggers the event.
- */
-#define GEMVISOR_SPURIOUS_FAULT_PORT	0x511
 
 /*
  * Returns 0 if mmiotrace is disabled, or if the fault is not
@@ -1041,8 +1033,8 @@ spurious_kernel_fault(unsigned long error_code, unsigned long address)
 	WARN_ONCE(!ret, "PMD has incorrect permission bits\n");
 
 	if (ret) {
-		/* Notify hypervisor of spurious fault for determinism debugging */
-		outl((u32)address, GEMVISOR_SPURIOUS_FAULT_PORT);
+		/* Emit guest trace event for determinism debugging */
+		gem_trace_spurious_fault(address, error_code);
 		pr_warn_ratelimited("spurious_kernel_fault: addr=%lx error_code=%lx\n",
 				    address, error_code);
 	}

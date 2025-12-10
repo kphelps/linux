@@ -226,6 +226,13 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 	gemvisor_trace_emit(GEM_EVT_PTE_MODIFY, 0, &_pl, sizeof(_pl)); \
 } while (0)
 
+/* Spurious kernel fault tracing (stale TLB entry) */
+#define gem_trace_spurious_fault(addr, error_code) do { \
+	struct { u64 addr_field; u32 error_code_field; } __packed _pl = { \
+		.addr_field = (u64)(addr), .error_code_field = (u32)(error_code) }; \
+	gemvisor_trace_emit(GEM_EVT_SPURIOUS_FAULT, 0, &_pl, sizeof(_pl)); \
+} while (0)
+
 /* Copy-on-write fault tracing */
 #define gem_trace_cow_fault(addr, old_pfn, new_pfn) do { \
 	struct { u64 addr_field; u64 old_pfn_field; u64 new_pfn_field; } __packed _pl = { \
