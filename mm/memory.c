@@ -3045,6 +3045,26 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
 	flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
 	entry = pte_mkyoung(vmf->orig_pte);
 	entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+
+	/*
+	 * GEMVISOR DETERMINISM: Eager TLB flush before PTE update.
+	 *
+	 * When upgrading permissions (RO->RW for COW), we must flush the TLB
+	 * immediately to prevent stale read-only entries from causing spurious
+	 * re-faults. Without this, there's a window where:
+	 *   1. PTE is updated to writable
+	 *   2. TLB still has stale read-only entry
+	 *   3. Another access faults again on the same address
+	 *
+	 * This matches the eager flush pattern in set_memory.c (patch 004)
+	 * but covers the user-space COW path which was previously missed.
+	 */
+	if (pte_write(entry) && !pte_write(vmf->orig_pte))
+		flush_tlb_page(vma, vmf->address);
+
+	/* Trace PTE modification for determinism debugging */
+	gem_trace_pte_modify(vmf->address, pte_val(vmf->orig_pte), pte_val(entry));
+
 	if (ptep_set_access_flags(vma, vmf->address, vmf->pte, entry, 1))
 		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -3363,6 +3383,9 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio = NULL;
+
+	/* GEMVISOR: Trace write-protect fault entry for determinism debugging */
+	gem_trace_do_wp_page(NULL, vmf->address, vmf->flags);
 
 	if (likely(!unshare)) {
 		if (userfaultfd_pte_wp(vma, ptep_get(vmf->pte))) {

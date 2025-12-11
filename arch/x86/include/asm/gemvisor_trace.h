@@ -12,7 +12,7 @@
 
 /* Guest physical address for the trace shared page */
 #define GEMVISOR_TRACE_PAGE_GPA    0xFEF10000
-#define GEMVISOR_TRACE_PAGE_SIZE   (16 * 1024)
+#define GEMVISOR_TRACE_PAGE_SIZE   (16 * 1024 * 1024)
 #define GEMVISOR_TRACE_MAGIC       0x47454D54  /* "GEMT" */
 #define GEMVISOR_TRACE_HEADER_SIZE 64
 

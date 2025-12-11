@@ -440,7 +440,16 @@ walk_pte:
 	}
 
 	pte = pte_offset_kernel(pmd, address);
-	if (pte)
-		pl->pte_val = pte_val(*pte);
+	if (pte) {
+		/*
+		 * GEMVISOR DETERMINISM: Use ptep_get() for safe atomic PTE read.
+		 *
+		 * This lockless read may race with concurrent PTE modifications.
+		 * ptep_get() provides the proper memory barrier and atomic read
+		 * to capture a consistent snapshot, avoiding torn reads that
+		 * could produce non-deterministic trace data.
+		 */
+		pl->pte_val = pte_val(ptep_get(pte));
+	}
 }
 EXPORT_SYMBOL_GPL(gem_trace_collect_pf_context);
