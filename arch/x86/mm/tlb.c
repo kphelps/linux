@@ -704,7 +704,12 @@ static void flush_tlb_func(void *info)
 	const struct flush_tlb_info *f = info;
 	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
 	u32 loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
-	/* GEMVISOR: local_tlb_gen removed - was only used for early-exit optimization */
+	/*
+	 * GEMVISOR: local_tlb_gen-based optimizations were temporarily disabled
+	 * for determinism. With eager COW TLB flushes in place, local_tlb_gen
+	 * remains deterministic across runs, so we can safely restore them.
+	 */
+	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
 	bool local = smp_processor_id() == f->initiating_cpu;
 	unsigned long nr_invalidate = 0;
 	u64 mm_tlb_gen;
@@ -759,19 +764,16 @@ static void flush_tlb_func(void *info)
 		return;
 	}
 
-	/*
-	 * GEMVISOR DETERMINISM PATCH:
-	 * REMOVED early return based on local_tlb_gen comparison.
-	 *
-	 * The original code had:
-	 *   if (f->new_tlb_gen != TLB_GENERATION_INVALID &&
-	 *       f->new_tlb_gen <= local_tlb_gen)
-	 *       return;
-	 *
-	 * This caused different instruction counts between VMs because
-	 * local_tlb_gen is per-CPU state that can evolve differently.
-	 * Always proceed to the flush to ensure identical execution paths.
-	 */
+	if (unlikely(f->new_tlb_gen != TLB_GENERATION_INVALID &&
+		     f->new_tlb_gen <= local_tlb_gen)) {
+		/*
+		 * The TLB is already up to date in respect to f->new_tlb_gen.
+		 * While the core might be still behind mm_tlb_gen, checking
+		 * mm_tlb_gen unnecessarily would have negative caching effects
+		 * so avoid it.
+		 */
+		return;
+	}
 
 	/*
 	 * Defer mm_tlb_gen reading as long as possible to avoid cache
@@ -779,42 +781,48 @@ static void flush_tlb_func(void *info)
 	 */
 	mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
 
-	/*
-	 * GEMVISOR DETERMINISM PATCH:
-	 * REMOVED early goto based on local_tlb_gen == mm_tlb_gen.
-	 *
-	 * The original code had:
-	 *   if (local_tlb_gen == mm_tlb_gen) goto done;
-	 *
-	 * This caused different instruction counts because the decision
-	 * to skip the flush depends on per-CPU state. Always do the flush.
-	 */
+	if (unlikely(local_tlb_gen == mm_tlb_gen))
+		goto done;
 
-	/*
-	 * GEMVISOR DETERMINISM PATCH:
-	 * Always do FULL TLB flush, never partial.
-	 *
-	 * The original code chose partial vs full based on:
-	 *   f->new_tlb_gen == local_tlb_gen + 1
-	 *
-	 * This per-CPU state comparison caused different execution paths
-	 * (loop vs single flush). For determinism, always do full flush.
-	 * This is slightly less efficient but guarantees identical
-	 * instruction sequences regardless of TLB generation state.
-	 */
-	nr_invalidate = TLB_FLUSH_ALL;
-	flush_tlb_local();
+	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
+	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
+
+	if (f->end != TLB_FLUSH_ALL &&
+	    f->new_tlb_gen == local_tlb_gen + 1 &&
+	    f->new_tlb_gen == mm_tlb_gen) {
+		/* Partial flush */
+		unsigned long addr = f->start;
+
+		/* Partial flush cannot have invalid generations */
+		VM_WARN_ON(f->new_tlb_gen == TLB_GENERATION_INVALID);
+
+		/* Partial flush must have valid mm */
+		VM_WARN_ON(f->mm == NULL);
+
+		nr_invalidate = (f->end - f->start) >> f->stride_shift;
+
+		while (addr < f->end) {
+			flush_tlb_one_user(addr);
+			addr += 1UL << f->stride_shift;
+		}
+		if (local)
+			count_vm_tlb_events(NR_TLB_LOCAL_FLUSH_ONE, nr_invalidate);
+	} else {
+		/* Full flush */
+		nr_invalidate = TLB_FLUSH_ALL;
+		flush_tlb_local();
+		if (local)
+			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+	}
 
 	/* GEMVISOR: Trace TLB flush for divergence debugging */
 	gem_trace_tlb_flush(local ? TLB_LOCAL_SHOOTDOWN : TLB_REMOTE_SHOOTDOWN, 0);
-
-	if (local)
-		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
 
 	/* Both paths above update our state to mm_tlb_gen. */
 	this_cpu_write(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen, mm_tlb_gen);
 
 	/* Tracing is done in a unified manner to reduce the code size */
+done:
 	trace_tlb_flush(!local ? TLB_REMOTE_SHOOTDOWN :
 				(f->mm == NULL) ? TLB_LOCAL_SHOOTDOWN :
 						  TLB_LOCAL_MM_SHOOTDOWN,
