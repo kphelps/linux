@@ -286,7 +286,7 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 	/* Build event header */
 	evt.size = event_size;
 	evt.type_hi = (event_type >> 8) & 0xFF;
-	evt.type_lo = event_type & 0xFFFF;
+	evt.type_lo = event_type & 0xFF;
 	evt.flags = flags;
 	evt.vtime_ns = vtime_ns;
 	evt.retired = vtime_ns;
