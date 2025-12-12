@@ -37,6 +37,8 @@
  * virtual time by the requested amount.
  */
 #define GEMVISOR_DELAY_PORT	0x510
+/* Must match GEMVISOR_MAX_DELAY_NS in the host to preserve delay semantics. */
+#define GEMVISOR_MAX_DELAY_NS	1000000000ULL
 
 static inline void gemvisor_delay_ns(unsigned long ns)
 {
@@ -247,12 +249,12 @@ void __delay(unsigned long loops)
 		ns = U64_MAX;
 	else
 		ns = (u64)loops * ns_per_jiffy;
-	ns = div_u64(ns, lpj);
+	ns = ns / (u64)lpj;
 
 	while (ns) {
-		u32 chunk = ns > U32_MAX ? U32_MAX : (u32)ns;
-		gemvisor_delay_ns(chunk);
-		ns -= chunk;
+		u64 chunk64 = ns > GEMVISOR_MAX_DELAY_NS ? GEMVISOR_MAX_DELAY_NS : ns;
+		gemvisor_delay_ns((unsigned long)chunk64);
+		ns -= chunk64;
 	}
 }
 EXPORT_SYMBOL(__delay);
