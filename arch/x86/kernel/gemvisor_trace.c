@@ -15,6 +15,7 @@
 #include <linux/panic.h>
 #include <linux/stacktrace.h>
 #include <linux/sched.h>
+#include <linux/smp.h>
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <asm/early_ioremap.h>
@@ -146,11 +147,11 @@ void __init gemvisor_trace_init(void)
 	 * We only need to read the header here; the full buffer is mapped
 	 * later via ioremap in gemvisor_trace_remap().
 	 */
-	ptr = early_ioremap(GEMVISOR_TRACE_PAGE_GPA, PAGE_SIZE);
-	if (!ptr) {
-		pr_info("gemvisor-trace: early_ioremap failed\n");
-		return;
-	}
+		ptr = early_ioremap(GEMVISOR_TRACE_PAGE_GPA, PAGE_SIZE);
+		if (!ptr) {
+			pr_warn("gemvisor-trace: early_ioremap failed\n");
+			return;
+		}
 
 	/* Check for gemvisor magic */
 	magic = readl(ptr);
@@ -219,11 +220,14 @@ void gemvisor_trace_emit_regs(u16 event_type, u32 flags, const void *payload, u8
 	unsigned long irq_flags;
 	u64 vtime_ns;
 
-	if (!trace_enabled || !trace_header)
-		return;
+		if (!trace_enabled || !trace_header)
+			return;
 
-	/* Prevent IRQ handlers from interleaving writes into the trace ring */
-	local_irq_save(irq_flags);
+		/* Single-vCPU only; the trace ring is not SMP-safe. */
+		WARN_ON_ONCE(num_online_cpus() > 1);
+
+		/* Prevent IRQ handlers from interleaving writes into the trace ring */
+		local_irq_save(irq_flags);
 
 	vtime_ns = gem_trace_read_vtime();
 	if (!regs)
