@@ -1021,7 +1021,7 @@ static int __should_split_large_page(pte_t *kpte, unsigned long address,
 	/* Eager flush when increasing permissions (determinism) */
 	if ((pgprot_val(cpa->mask_clr) & _PAGE_NX) ||
 	    (pgprot_val(cpa->mask_set) & _PAGE_RW))
-		flush_tlb_all();
+		flush_tlb_kernel_range(lpaddr, lpaddr + psize);
 #endif
 
 	cpa_inc_lp_preserved(level);
