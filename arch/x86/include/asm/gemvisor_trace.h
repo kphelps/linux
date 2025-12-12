@@ -9,9 +9,9 @@
 #define _ASM_X86_GEMVISOR_TRACE_H
 
 #include <linux/types.h>
+#include <asm/gemvisor.h>
 
-/* Guest physical address for the trace shared page */
-#define GEMVISOR_TRACE_PAGE_GPA    0xFEF10000
+/* Guest physical address for the trace shared page (see asm/gemvisor.h) */
 #define GEMVISOR_TRACE_PAGE_SIZE   (16 * 1024 * 1024)
 #define GEMVISOR_TRACE_MAGIC       0x47454D54  /* "GEMT" */
 #define GEMVISOR_TRACE_HEADER_SIZE 64

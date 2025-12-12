@@ -18,6 +18,7 @@
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <asm/early_ioremap.h>
+#include <asm/gemvisor.h>
 #include <asm/gemvisor_trace.h>
 #include <asm/irq_regs.h>
 #include <asm/msr.h>
@@ -35,9 +36,6 @@ static void __iomem *trace_buffer;
 static bool trace_enabled;
 static bool gemvisor_detected;
 static u32 ring_buffer_size = GEMVISOR_TRACE_PAGE_SIZE - GEMVISOR_TRACE_HEADER_SIZE;
-
-/* I/O port for trace hypercalls (KVM reliably forwards I/O to userspace) */
-#define GEMVISOR_TRACE_PORT	0x512
 
 /* Trace hypercall commands */
 #define TRACE_CMD_INIT		1

@@ -23,6 +23,7 @@
 #include <asm/timer.h>
 #include <asm/mwait.h>
 #include <asm/io.h>
+#include <asm/gemvisor.h>
 
 #ifdef CONFIG_SMP
 # include <asm/smp.h>
@@ -36,7 +37,6 @@
  * value to an IO port. The hypervisor intercepts this and advances
  * virtual time by the requested amount.
  */
-#define GEMVISOR_DELAY_PORT	0x510
 /* Must match GEMVISOR_MAX_DELAY_NS in the host to preserve delay semantics. */
 #define GEMVISOR_MAX_DELAY_NS	1000000000ULL
 
