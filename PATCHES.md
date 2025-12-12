@@ -156,6 +156,92 @@ With the IO port approach:
 - IO writes to port 0x510 advance vtime by the written nanoseconds value
 - Supports both 4-byte (u32) and 8-byte (u64) writes
 
+## 6. Disable Hardware Breakpoint Activity Checks
+
+**Kernel Version:** 6.6.61
+
+**File Modified:** `arch/x86/include/asm/debugreg.h`
+
+**Change:**
+Force `hw_breakpoint_active()` to always return false:
+
+```diff
+ static __always_inline bool hw_breakpoint_active(void)
+ {
+-	return this_cpu_read(cpu_dr7) & DR7_ACTIVE_MASK;
++	/* GEMVISOR: force deterministic path */
++	return false;
+ }
+```
+
+**Reason:**
+During text-patching and other sensitive paths (e.g., `text_poke()` via `use_temporary_mm()`), the kernel conditionally disables hardware breakpoints based on the per‑CPU `cpu_dr7` shadow state. After snapshot/restore, that shadow can legitimately differ between identical VMs, causing:
+
+- Different branch decisions (disable vs. skip disable)
+- Different instruction counts and debug‑register side effects
+
+By forcing the “no breakpoints active” path, the guest always takes the same instruction sequence.
+
+**Impact:**
+- Hardware watchpoints / breakpoints are effectively disabled in the guest.
+- Tools relying on DR registers (GDB HW watchpoints, perf HW breakpoints, KGDB) will not work.
+- Deterministic text‑patching paths no longer depend on per‑CPU debug state.
+
+## 7. Deterministic CR4 Shadow Updates
+
+**Kernel Version:** 6.6.61
+
+**Files Modified:**
+- `arch/x86/kernel/cpu/common.c`
+- `arch/x86/kernel/process.c`
+- `arch/x86/mm/tlb.c`
+
+**Change:**
+Make CR4 update helpers derive from the real CR4 register and always write unconditionally:
+
+- `cr4_update_irqsoff(set, clear)` now reads CR4 via `__read_cr4()` instead of `cpu_tlbstate.cr4`, computes `newval`, then writes both the shadow and hardware CR4 every call.
+- `cr4_toggle_bits_irqsoff(mask)` similarly reads CR4 from hardware and writes both shadow + hardware unconditionally.
+- `cr4_update_pce_mm()` always clears `CR4.PCE` rather than branching on per‑CPU perf state.
+
+**Reason:**
+Upstream uses per‑CPU CR4 shadow state (`cpu_tlbstate.cr4`) and perf bookkeeping to avoid redundant CR4 writes. After snapshot/restore, those per‑CPU shadows may differ between otherwise identical VMs. If we base CR4 decisions on those shadows, the guest can:
+
+- Take different branches
+- Execute different numbers of CR4 writes over time
+- Accumulate instruction‑count drift
+
+Reading the authoritative hardware CR4 value eliminates the per‑CPU dependency, and unconditional writes keep instruction counts identical regardless of prior state.
+
+**Impact:**
+- Eliminates CR4‑shadow divergence across restores.
+- Minor performance cost from extra CR4 reads/writes.
+- User‑level RDPMC (CR4.PCE) is always disabled, matching gemvisor’s deterministic PMU model.
+
+## 8. Eager TLB Flushes on Permission Upgrades
+
+**Kernel Version:** 6.6.61
+
+**Files Modified:**
+- `arch/x86/mm/pat/set_memory.c`
+- `mm/memory.c`
+- `arch/x86/kernel/ldt.c`
+
+**Change:**
+Flush stale TLB entries immediately when increasing permissions:
+
+- In `set_memory_*()` (CPA / PAT path), after updating a PTE/PMD to **clear NX** or **set RW**, flush the relevant TLB entries eagerly (`flush_tlb_one_kernel()` for 4K mappings; `flush_tlb_all()` for large mappings).
+- In the COW fast‑path (`wp_page_reuse()`), flush `flush_tlb_page()` before installing a writable PTE.
+- In the LDT IPI handler (`flush_ldt()`), remove the early return that depended on `cpu_tlbstate.loaded_mm` and always reload LDT + refresh segment caches.
+
+**Reason:**
+Linux normally defers TLB invalidation on permission increases for performance. That can leave stale RO/NX entries resident, producing **spurious faults** whose timing varies between runs. In gemvisor’s determinism model, that window is unacceptable because fault arrival can differ by a few instructions after restore.
+
+Eager flushing removes the stale‑TLB window and also avoids branching on per‑CPU mm state in the LDT flush path.
+
+**Impact:**
+- Spurious faults from lazy permission upgrades should not occur; any remaining cases are surfaced by patch 9 instrumentation.
+- More TLB flushes (minor perf hit) but deterministic fault behavior.
+
 ## 9. Spurious Kernel Fault Instrumentation
 
 **Kernel Version:** 6.6.61
@@ -240,14 +326,13 @@ By removing the conditional, both VMs always execute the same code path regardle
 **Impact:**
 - Eliminates per-CPU state divergence in switch_mm_irqs_off
 - Both functions are safe to call unconditionally:
-  - `cr4_update_pce_mm()`: Always clears CR4.PCE (via patch 006)
+  - `cr4_update_pce_mm()`: Always clears CR4.PCE (via patch 7)
   - `switch_ldt()`: Internal conditional checks for LDT presence; no-op for most workloads
 - Minimal performance impact: extra function calls that typically do nothing
 - Required for instruction-level determinism during mm context switches
 
 **Related Patches:**
-- Patch 006: Deterministic CR4.PCE updates (cr4_update_pce_mm always clears PCE)
-- Patch 008: Additional CR4 update determinism (cr4_update_irqsoff always writes CR4)
+- Patch 7: Deterministic CR4 updates (cr4_update_pce_mm/irqsoff/toggle helpers)
 
 ## 11. Deterministic ASID Allocation in choose_new_asid
 
