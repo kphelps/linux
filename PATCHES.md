@@ -524,3 +524,40 @@ These early returns caused wildly different instruction counts (hundreds of inst
 - After patches 11-12: Failed at iteration 2, quantum 9389 (~449K total quanta)
 - After patches 13-15: Failed at iteration 3, quantum 1267 (~661K total quanta)
 - Total improvement: ~3x more deterministic execution before divergence
+
+## 16. Stabilize Page-Table Accessed/Dirty Bits (A/D)
+
+**Kernel Version:** 6.6.61
+
+**Files Modified:**
+- `arch/x86/mm/pgtable.c`
+- `arch/x86/include/asm/pgtable.h`
+
+**Change:**
+When `CONFIG_GEMVISOR_DETERMINISM=y`, prevent the guest from clearing page‑table Accessed bits and pre‑set A/D bits on new mappings:
+
+- The aging helpers no longer clear the Accessed (A) bit:
+  - `ptep_test_and_clear_young()`
+  - `pmdp_test_and_clear_young()`
+  - `pudp_test_and_clear_young()`
+  - They now return whether the entry is young but leave `_PAGE_ACCESSED` set.
+- The “mkold” helpers become no‑ops:
+  - `pte_mkold()`, `pmd_mkold()`, `pud_mkold()` return the entry unchanged.
+- On installation of present mappings:
+  - `pfn_pte()`, `pfn_pmd()`, `pfn_pud()` always set `_PAGE_ACCESSED`.
+  - If the entry is writable, they also set `_PAGE_DIRTY`.
+- Writable mapping constructors start dirty:
+  - `pte_mkwrite_novma()`, `pmd_mkwrite_novma()`, and `pud_mkwrite()` set Dirty alongside RW.
+
+**Reason:**
+x86 hardware sets A/D bits lazily during page walks. The exact instruction at which the CPU decides to set these bits can vary between runs due to microarchitectural timing and KVM skid. Two deterministic runs restored from the same snapshot can therefore diverge in paging‑structure RAM if:
+
+1. The guest clears A bits for aging, and hardware re‑sets them later at different times.
+2. The CPU tries to set A/D on a page‑table page that is currently mapped RX/shared after a checkpoint, causing first‑touch faults at different RIPs.
+
+By never clearing A and pre‑setting A/D in software for present mappings, the guest avoids later hardware A/D updates entirely, keeping page‑table contents stable across checkpoints/restores.
+
+**Impact:**
+- Page aging may treat entries as “young” longer, which can mildly reduce reclamation efficiency.
+- Writable mappings start Dirty more often, increasing dirty‑tracking pressure slightly.
+- Both effects are accepted trade‑offs for instruction‑level determinism.
