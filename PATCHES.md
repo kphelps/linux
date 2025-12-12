@@ -346,7 +346,7 @@ By removing the conditional, both VMs always execute the same code path regardle
 **File Modified:** `arch/x86/mm/tlb.c`
 
 **Change:**
-Skip the ASID cache lookup loop and always allocate a fresh ASID:
+Skip the ASID cache lookup loop and always use ASID 0 (fresh) with an unconditional flush:
 
 ```diff
  static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
@@ -360,9 +360,9 @@ Skip the ASID cache lookup loop and always allocate a fresh ASID:
  		return;
  	}
 
- 	if (this_cpu_read(cpu_tlbstate.invalidate_other))
- 		clear_asid_other();
-
+-	if (this_cpu_read(cpu_tlbstate.invalidate_other))
+-		clear_asid_other();
+-
 -	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++) {
 -		if (this_cpu_read(cpu_tlbstate.ctxs[asid].ctx_id) !=
 -		    next->context.ctx_id)
@@ -374,31 +374,35 @@ Skip the ASID cache lookup loop and always allocate a fresh ASID:
 -		return;
 -	}
 -
-+	/* GEMVISOR: Always allocate fresh ASID (skip cache lookup loop) */
- 	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
- 	if (*new_asid >= TLB_NR_DYN_ASIDS) {
- 		*new_asid = 0;
- 		this_cpu_write(cpu_tlbstate.next_asid, 1);
- 	}
- 	*need_flush = true;
+-	/* GEMVISOR: Always allocate fresh ASID (skip cache lookup loop) */
+-	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
+-	if (*new_asid >= TLB_NR_DYN_ASIDS) {
+-		*new_asid = 0;
+-		this_cpu_write(cpu_tlbstate.next_asid, 1);
+-	}
+-	*need_flush = true;
++	/* GEMVISOR: clear other-ASID slots only when PTI is enabled. */
++	if (static_cpu_has(X86_FEATURE_PTI))
++		clear_asid_other();
++
++	/* GEMVISOR: Always use ASID 0 and always flush. */
++	*new_asid = 0;
++	*need_flush = true;
  }
 ```
 
 **Reason:**
-The original code loops through `cpu_tlbstate.ctxs[]` searching for a cached ASID with matching ctx_id. This loop's iteration count depends on per-CPU state that can differ between VMs after snapshot restore:
-- VM A might find a cached ASID after 2 iterations
-- VM B might find it after 5 iterations (or not at all)
-- Different loop counts = different instruction counts = divergence
+The upstream implementation has two nondeterministic sources after restore:
 
-By always allocating a fresh ASID:
-- No dependency on ctxs[] cache state
-- Always `need_flush=true` (guaranteed TLB consistency)
-- Predictable instruction count regardless of per-CPU cache state
+1. **Cache lookup loop:** It scans `cpu_tlbstate.ctxs[]` to find a matching cached ASID. The iteration count and early‑exit point depend on per‑CPU cache contents, which may diverge across restores → different instruction counts.
+2. **next_asid wrap‑around:** If no cached ASID is found, it increments `cpu_tlbstate.next_asid` and conditionally wraps at `TLB_NR_DYN_ASIDS`. Divergent per‑CPU counters lead to different wrap branches.
+
+Gemvisor removes both by skipping the lookup loop entirely and pinning all user ASID allocations to **ASID 0** with `need_flush=true`. The PTI guard remains a `static_cpu_has()` check (boot‑time constant), so both VMs take the same path.
 
 **Impact:**
-- Eliminates ASID cache lookup divergence
-- Slightly more TLB flushes (minor performance impact on modern CPUs with INVPCID)
-- Determinism is more valuable than TLB caching for gemvisor
+- Eliminates ASID‑related per‑CPU state divergence at context switches.
+- Always flushes user TLBs on switch (small perf hit; acceptable for determinism).
+- Disables ASID rotation/caching optimizations, but single‑ASID workloads remain efficient on modern CPUs.
 
 ## 12. Skip Speculative Execution Mitigations in cond_mitigation
 
