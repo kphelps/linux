@@ -18,10 +18,12 @@ static inline int __paravirt_pgd_alloc(struct mm_struct *mm)
 {
 	if (mm && mm->pgd) {
 		unsigned long pfn = __pa(mm->pgd) >> PAGE_SHIFT;
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 		kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
 #ifdef CONFIG_PAGE_TABLE_ISOLATION
 		kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn + 1);
 #endif
+#endif /* CONFIG_GEMVISOR_DETERMINISM */
 	}
 	return 0;
 }
@@ -42,25 +44,35 @@ static inline void paravirt_pgd_free(struct mm_struct *mm, pgd_t *pgd) {}
  */
 static inline void paravirt_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+#endif
 }
 static inline void paravirt_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+#endif
 }
 static inline void paravirt_alloc_pmd_clone(unsigned long pfn, unsigned long clonepfn,
 					    unsigned long start, unsigned long count)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
 	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, clonepfn);
+#endif
 }
 static inline void paravirt_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+#endif
 }
 static inline void paravirt_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+#endif
 }
 static inline void paravirt_release_pte(unsigned long pfn) {}
 static inline void paravirt_release_pmd(unsigned long pfn) {}

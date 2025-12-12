@@ -411,8 +411,12 @@ static inline pte_t pte_mkclean(pte_t pte)
 
 static inline pte_t pte_mkold(pte_t pte)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: never clear Accessed to avoid A-bit drift. */
 	return pte;
+#else
+	return pte_clear_flags(pte, _PAGE_ACCESSED);
+#endif
 }
 
 static inline pte_t pte_mkexec(pte_t pte)
@@ -441,8 +445,12 @@ static inline pte_t pte_mkyoung(pte_t pte)
 
 static inline pte_t pte_mkwrite_novma(pte_t pte)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: writable mappings start Dirty. */
 	return pte_set_flags(pte, _PAGE_RW | _PAGE_DIRTY);
+#else
+	return pte_set_flags(pte, _PAGE_RW);
+#endif
 }
 
 struct vm_area_struct;
@@ -542,8 +550,12 @@ static inline pmd_t pmd_clear_uffd_wp(pmd_t pmd)
 
 static inline pmd_t pmd_mkold(pmd_t pmd)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: never clear Accessed to avoid A-bit drift. */
 	return pmd;
+#else
+	return pmd_clear_flags(pmd, _PAGE_ACCESSED);
+#endif
 }
 
 static inline pmd_t pmd_mkclean(pmd_t pmd)
@@ -582,8 +594,12 @@ static inline pmd_t pmd_mkyoung(pmd_t pmd)
 
 static inline pmd_t pmd_mkwrite_novma(pmd_t pmd)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: writable mappings start Dirty. */
 	return pmd_set_flags(pmd, _PAGE_RW | _PAGE_DIRTY);
+#else
+	return pmd_set_flags(pmd, _PAGE_RW);
+#endif
 }
 
 pmd_t pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma);
@@ -623,8 +639,12 @@ static inline pud_t pud_clear_saveddirty(pud_t pud)
 
 static inline pud_t pud_mkold(pud_t pud)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: never clear Accessed to avoid A-bit drift. */
 	return pud;
+#else
+	return pud_clear_flags(pud, _PAGE_ACCESSED);
+#endif
 }
 
 static inline pud_t pud_mkclean(pud_t pud)
@@ -668,8 +688,12 @@ static inline pud_t pud_mkyoung(pud_t pud)
 
 static inline pud_t pud_mkwrite(pud_t pud)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: writable mappings start Dirty. */
 	pud = pud_set_flags(pud, _PAGE_RW | _PAGE_DIRTY);
+#else
+	pud = pud_set_flags(pud, _PAGE_RW);
+#endif
 
 	return pud_clear_saveddirty(pud);
 }
@@ -758,6 +782,7 @@ static inline pte_t pfn_pte(unsigned long page_nr, pgprot_t pgprot)
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
 	pgprotval_t flags = check_pgprot(pgprot);
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM: Canonicalize paging A/D bits.
 	 *
@@ -769,6 +794,7 @@ static inline pte_t pfn_pte(unsigned long page_nr, pgprot_t pgprot)
 	flags |= _PAGE_ACCESSED;
 	if (flags & _PAGE_RW)
 		flags |= _PAGE_DIRTY;
+#endif
 
 	pfn ^= protnone_mask(pgprot_val(pgprot));
 	pfn &= PTE_PFN_MASK;
@@ -780,10 +806,12 @@ static inline pmd_t pfn_pmd(unsigned long page_nr, pgprot_t pgprot)
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
 	pgprotval_t flags = check_pgprot(pgprot);
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* See pfn_pte() determinism note above. */
 	flags |= _PAGE_ACCESSED;
 	if (flags & _PAGE_RW)
 		flags |= _PAGE_DIRTY;
+#endif
 
 	pfn ^= protnone_mask(pgprot_val(pgprot));
 	pfn &= PHYSICAL_PMD_PAGE_MASK;
@@ -795,10 +823,12 @@ static inline pud_t pfn_pud(unsigned long page_nr, pgprot_t pgprot)
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
 	pgprotval_t flags = check_pgprot(pgprot);
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* See pfn_pte() determinism note above. */
 	flags |= _PAGE_ACCESSED;
 	if (flags & _PAGE_RW)
 		flags |= _PAGE_DIRTY;
+#endif
 
 	pfn ^= protnone_mask(pgprot_val(pgprot));
 	pfn &= PHYSICAL_PUD_PAGE_MASK;

@@ -117,7 +117,11 @@ static inline void hw_breakpoint_disable(void)
  */
 static __always_inline bool hw_breakpoint_active(void)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	return false; /* GEMVISOR: force deterministic path */
+#else
+	return __this_cpu_read(cpu_dr7) & DR_GLOBAL_ENABLE_MASK;
+#endif
 }
 
 extern void hw_breakpoint_restore(void);

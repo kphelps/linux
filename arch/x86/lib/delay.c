@@ -37,6 +37,7 @@
  * value to an IO port. The hypervisor intercepts this and advances
  * virtual time by the requested amount.
  */
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 /* Must match GEMVISOR_MAX_DELAY_NS in the host to preserve delay semantics. */
 #define GEMVISOR_MAX_DELAY_NS	1000000000ULL
 
@@ -48,6 +49,7 @@ static inline void gemvisor_delay_ns(unsigned long ns)
 	 */
 	outl((u32)ns, GEMVISOR_DELAY_PORT);
 }
+#endif /* CONFIG_GEMVISOR_DETERMINISM */
 
 static void delay_loop(u64 __loops);
 
@@ -222,6 +224,7 @@ int read_current_timer(unsigned long *timer_val)
 
 void __delay(unsigned long loops)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * For gemvisor deterministic execution: convert loops to nanoseconds
 	 * and use IO port to advance virtual time.
@@ -256,6 +259,9 @@ void __delay(unsigned long loops)
 		gemvisor_delay_ns((unsigned long)chunk64);
 		ns -= chunk64;
 	}
+#else
+	delay_fn(loops);
+#endif
 }
 EXPORT_SYMBOL(__delay);
 

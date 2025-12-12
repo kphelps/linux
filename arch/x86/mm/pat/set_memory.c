@@ -1017,10 +1017,12 @@ static int __should_split_large_page(pte_t *kpte, unsigned long address,
 	__set_pmd_pte(kpte, address, new_pte);
 	cpa->flags |= CPA_FLUSHTLB;
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* Eager flush when increasing permissions (determinism) */
 	if ((pgprot_val(cpa->mask_clr) & _PAGE_NX) ||
 	    (pgprot_val(cpa->mask_set) & _PAGE_RW))
 		flush_tlb_all();
+#endif
 
 	cpa_inc_lp_preserved(level);
 	return 0;
@@ -1679,10 +1681,12 @@ repeat:
 			set_pte_atomic(kpte, new_pte);
 			cpa->flags |= CPA_FLUSHTLB;
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 			/* Eager flush when increasing permissions (determinism) */
 			if ((pgprot_val(cpa->mask_clr) & _PAGE_NX) ||
 			    (pgprot_val(cpa->mask_set) & _PAGE_RW))
 				flush_tlb_one_kernel(address);
+#endif
 		}
 		cpa->numpages = 1;
 		return 0;

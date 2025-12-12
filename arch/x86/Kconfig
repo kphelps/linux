@@ -830,6 +830,19 @@ config KVM_GUEST
 	  underlying device model, the host provides the guest with
 	  timing infrastructure such as time of day, and system time
 
+config GEMVISOR_DETERMINISM
+	bool "Gemvisor instruction-level determinism"
+	depends on KVM_GUEST
+	default y
+	help
+	  Enable guest-kernel changes required for gemvisor's instruction-level
+	  deterministic execution and snapshot/restore. These patches trade
+	  performance and some security mitigations for identical instruction
+	  streams across runs.
+
+	  Disable this option to build a standard KVM guest kernel from the
+	  same source tree.
+
 config ARCH_CPUIDLE_HALTPOLL
 	def_bool n
 	prompt "Disable host haltpoll when loading haltpoll driver"

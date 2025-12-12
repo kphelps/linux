@@ -453,6 +453,7 @@ void cr4_update_irqsoff(unsigned long set, unsigned long clear)
 
 	lockdep_assert_irqs_disabled();
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM PATCH (v2):
 	 * Read actual CR4 register instead of per-CPU shadow (cpu_tlbstate.cr4).
@@ -470,6 +471,14 @@ void cr4_update_irqsoff(unsigned long set, unsigned long clear)
 	/* Update both shadow and actual register for consistency */
 	this_cpu_write(cpu_tlbstate.cr4, newval);
 	__write_cr4(newval);
+#else
+	cr4 = this_cpu_read(cpu_tlbstate.cr4);
+	newval = (cr4 & ~clear) | set;
+	if (newval != cr4) {
+		this_cpu_write(cpu_tlbstate.cr4, newval);
+		__write_cr4(newval);
+	}
+#endif
 }
 EXPORT_SYMBOL(cr4_update_irqsoff);
 

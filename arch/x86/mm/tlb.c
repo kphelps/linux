@@ -209,9 +209,21 @@ static void clear_asid_other(void)
 	 * snapshot restore. Clearing the current ASID is harmless since we're
 	 * about to allocate a fresh one anyway in choose_new_asid().
 	 */
+#ifdef CONFIG_GEMVISOR_DETERMINISM
+	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++)
+		this_cpu_write(cpu_tlbstate.ctxs[asid].ctx_id, 0);
+#else
 	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++) {
+		/* Do not need to flush the current asid */
+		if (asid == this_cpu_read(cpu_tlbstate.loaded_mm_asid))
+			continue;
+		/*
+		 * Make sure the next time we go to switch to
+		 * this asid, we do a flush:
+		 */
 		this_cpu_write(cpu_tlbstate.ctxs[asid].ctx_id, 0);
 	}
+#endif
 	this_cpu_write(cpu_tlbstate.invalidate_other, false);
 }
 
@@ -221,6 +233,7 @@ atomic64_t last_mm_ctx_id = ATOMIC64_INIT(1);
 static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 			    u16 *new_asid, bool *need_flush)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
 	 * Always allocate a fresh ASID instead of searching the ctxs[] cache.
@@ -280,6 +293,40 @@ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 	 */
 	*new_asid = 0;
 	*need_flush = true;
+#else
+	u16 asid;
+
+	if (!static_cpu_has(X86_FEATURE_PCID)) {
+		*new_asid = 0;
+		*need_flush = true;
+		return;
+	}
+
+	if (this_cpu_read(cpu_tlbstate.invalidate_other))
+		clear_asid_other();
+
+	for (asid = 0; asid < TLB_NR_DYN_ASIDS; asid++) {
+		if (this_cpu_read(cpu_tlbstate.ctxs[asid].ctx_id) !=
+		    next->context.ctx_id)
+			continue;
+
+		*new_asid = asid;
+		*need_flush = (this_cpu_read(cpu_tlbstate.ctxs[asid].tlb_gen) <
+			       next_tlb_gen);
+		return;
+	}
+
+	/*
+	 * We don't currently own an ASID slot on this CPU.
+	 * Allocate a slot.
+	 */
+	*new_asid = this_cpu_add_return(cpu_tlbstate.next_asid, 1) - 1;
+	if (*new_asid >= TLB_NR_DYN_ASIDS) {
+		*new_asid = 0;
+		this_cpu_write(cpu_tlbstate.next_asid, 1);
+	}
+	*need_flush = true;
+#endif
 }
 
 /*
@@ -330,20 +377,36 @@ static void load_new_mm_cr3(pgd_t *pgdir, u16 new_asid, unsigned long lam,
 
 void leave_mm(int cpu)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
 	 * Always call switch_mm() unconditionally, regardless of loaded_mm state.
-	 * The original code had:
-	 *   if (loaded_mm == &init_mm) return;
-	 * which caused different instruction counts based on per-CPU state.
-	 *
-	 * We still read loaded_mm to maintain consistent instruction count,
-	 * but never branch on it. When loaded_mm is already init_mm,
-	 * switch_mm(NULL, &init_mm, NULL) is effectively a no-op.
+	 * The original code branched on loaded_mm, causing instruction-count
+	 * drift when per-CPU state differed across restores.
 	 */
-	struct mm_struct *loaded_mm __maybe_unused = this_cpu_read(cpu_tlbstate.loaded_mm);
-	(void)loaded_mm;  /* Suppress unused warning, keep read for instruction count */
+	struct mm_struct *loaded_mm __maybe_unused =
+		this_cpu_read(cpu_tlbstate.loaded_mm);
+	(void)loaded_mm;
 	switch_mm(NULL, &init_mm, NULL);
+#else
+	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+
+	/*
+	 * It's plausible that we're in lazy TLB mode while our mm is init_mm.
+	 * If so, our callers still expect us to flush the TLB, but there
+	 * aren't any user TLB entries in init_mm to worry about.
+	 *
+	 * This needs to happen before any other sanity checks due to
+	 * intel_idle's shenanigans.
+	 */
+	if (loaded_mm == &init_mm)
+		return;
+
+	/* Warn if we're not lazy. */
+	WARN_ON(!this_cpu_read(cpu_tlbstate_shared.is_lazy));
+
+	switch_mm(NULL, &init_mm, NULL);
+#endif
 }
 EXPORT_SYMBOL_GPL(leave_mm);
 
@@ -380,28 +443,48 @@ static void cond_mitigation(struct task_struct *next)
 
 	next_mm = mm_mangle_tif_spec_bits(next);
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
 	 * Skip all speculative execution mitigations (IBPB, L1D flush) that
 	 * depend on per-CPU state (cpu_tlbstate.last_user_mm_spec).
-	 *
-	 * The original code reads last_user_mm_spec and compares it with
-	 * next_mm to decide whether to issue IBPB or L1D flush. This creates
-	 * a dependency on per-CPU state that can differ between VMs after
-	 * snapshot restore, causing different instruction counts.
-	 *
-	 * In the gemvisor deterministic execution model:
-	 * - Spectre/Meltdown mitigations are not needed (controlled environment)
-	 * - L1D cache timing is not exploitable (deterministic scheduling)
-	 * - IBPB adds non-deterministic branch predictor state
-	 *
-	 * By skipping these mitigations, we ensure identical instruction
-	 * sequences regardless of prior context switch history.
-	 *
-	 * Still update the per-CPU state for other kernel subsystems that
-	 * might read it (though they shouldn't in gemvisor's single-vCPU model).
 	 */
 	this_cpu_write(cpu_tlbstate.last_user_mm_spec, next_mm);
+#else
+	unsigned long prev_mm = this_cpu_read(cpu_tlbstate.last_user_mm_spec);
+
+	/*
+	 * Avoid user/user BTB poisoning by flushing the branch predictor
+	 * when switching between processes. This stops one process from
+	 * doing Spectre-v2 attacks on another.
+	 *
+	 * Both, the conditional and the always IBPB mode use the mm
+	 * pointer to avoid the IBPB when switching between tasks of the
+	 * same process. Using the mm pointer instead of mm->context.ctx_id
+	 * opens a hypothetical hole vs. mm_struct reuse, which is more or
+	 * less impossible to control by an attacker. Aside of that it
+	 * would only affect the first schedule so the theoretically
+	 * exposed data is not really interesting.
+	 */
+	if (static_branch_likely(&switch_mm_cond_ibpb)) {
+		if (next_mm != prev_mm &&
+		    (next_mm | prev_mm) & LAST_USER_MM_IBPB)
+			indirect_branch_prediction_barrier();
+	}
+
+	if (static_branch_unlikely(&switch_mm_always_ibpb)) {
+		if ((prev_mm & ~LAST_USER_MM_SPEC_MASK) !=
+					(unsigned long)next->mm)
+			indirect_branch_prediction_barrier();
+	}
+
+	if (static_branch_unlikely(&switch_mm_cond_l1d_flush)) {
+		if (unlikely((prev_mm | next_mm) & LAST_USER_MM_L1D_FLUSH))
+			l1d_flush_evaluate(prev_mm, next_mm, next);
+	}
+
+	this_cpu_write(cpu_tlbstate.last_user_mm_spec, next_mm);
+#endif
 }
 
 #ifdef CONFIG_PERF_EVENTS
@@ -414,7 +497,17 @@ static void cond_mitigation(struct task_struct *next)
  */
 static inline void cr4_update_pce_mm(struct mm_struct *mm)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	cr4_clear_bits_irqsoff(X86_CR4_PCE); /* GEMVISOR: force deterministic path */
+#else
+	if (static_branch_unlikely(&rdpmc_always_available_key) ||
+	    (!static_branch_unlikely(&rdpmc_never_available_key) &&
+	     atomic_read(&mm->context.perf_rdpmc_allowed))) {
+		perf_clear_dirty_counters();
+		cr4_set_bits_irqsoff(X86_CR4_PCE);
+	} else
+		cr4_clear_bits_irqsoff(X86_CR4_PCE);
+#endif
 }
 
 void cr4_update_pce(void *ignored)
@@ -429,6 +522,7 @@ static inline void cr4_update_pce_mm(struct mm_struct *mm) { }
 void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			struct task_struct *tsk)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
 	 * We still need to read cpu_tlbstate.loaded_mm because the `prev` parameter
@@ -608,6 +702,92 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 */
 	cr4_update_pce_mm(next);
 	switch_ldt(real_prev, next);
+#else
+	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+	bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
+	unsigned cpu = smp_processor_id();
+	unsigned long new_lam;
+	u64 next_tlb_gen;
+	bool need_flush;
+	u16 new_asid;
+
+	/* We don't want flush_tlb_func() to run concurrently with us. */
+	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
+		WARN_ON_ONCE(!irqs_disabled());
+
+#ifdef CONFIG_DEBUG_VM
+	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid,
+						   tlbstate_lam_cr3_mask()))) {
+		__flush_tlb_all();
+	}
+#endif
+	if (was_lazy)
+		this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
+
+	if (real_prev == next) {
+		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
+			   next->context.ctx_id);
+
+		if (WARN_ON_ONCE(real_prev != &init_mm &&
+				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
+			cpumask_set_cpu(cpu, mm_cpumask(next));
+
+		if (!was_lazy)
+			return;
+
+		smp_mb();
+		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
+		if (this_cpu_read(cpu_tlbstate.ctxs[prev_asid].tlb_gen) ==
+				next_tlb_gen)
+			return;
+
+		new_asid = prev_asid;
+		need_flush = true;
+	} else {
+		cond_mitigation(tsk);
+
+		if (real_prev != &init_mm) {
+			VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu,
+						mm_cpumask(real_prev)));
+			cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
+		}
+
+		if (next != &init_mm)
+			cpumask_set_cpu(cpu, mm_cpumask(next));
+		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
+
+		choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
+
+		this_cpu_write(cpu_tlbstate.loaded_mm, LOADED_MM_SWITCHING);
+		barrier();
+	}
+
+	new_lam = mm_lam_cr3_mask(next);
+	set_tlbstate_lam_mode(next);
+
+	if (need_flush) {
+		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
+		this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
+		load_new_mm_cr3(next->pgd, new_asid, new_lam, true);
+
+		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
+	} else {
+		load_new_mm_cr3(next->pgd, new_asid, new_lam, false);
+
+		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, 0);
+	}
+
+	barrier();
+
+	this_cpu_write(cpu_tlbstate.loaded_mm, next);
+	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
+
+	if (next != real_prev) {
+		cr4_update_pce_mm(next);
+		switch_ldt(real_prev, next);
+	}
+#endif
 }
 
 /*
@@ -625,6 +805,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
  */
 void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
 	 * Removed early return based on cpu_tlbstate.loaded_mm == &init_mm.
@@ -637,6 +818,12 @@ void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
 	 * TLB entries that would be affected by lazy behavior.
 	 */
 	this_cpu_write(cpu_tlbstate_shared.is_lazy, true);
+#else
+	if (this_cpu_read(cpu_tlbstate.loaded_mm) == &init_mm)
+		return;
+
+	this_cpu_write(cpu_tlbstate_shared.is_lazy, true);
+#endif
 }
 
 /*
@@ -698,6 +885,7 @@ void initialize_tlbstate_and_flush(void)
  */
 static void flush_tlb_func(void *info)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * We have three different tlb_gen values in here.  They are:
 	 *
@@ -818,6 +1006,77 @@ done:
 				(f->mm == NULL) ? TLB_LOCAL_SHOOTDOWN :
 						  TLB_LOCAL_MM_SHOOTDOWN,
 			nr_invalidate);
+#else
+	const struct flush_tlb_info *f = info;
+	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+	u32 loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+	u64 mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
+	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
+	bool local = smp_processor_id() == f->initiating_cpu;
+	unsigned long nr_invalidate = 0;
+
+	/* This code cannot presently handle being reentered. */
+	VM_WARN_ON(!irqs_disabled());
+
+	if (!local) {
+		inc_irq_stat(irq_tlb_count);
+		count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
+
+		/* Can only happen on remote CPUs */
+		if (f->mm && f->mm != loaded_mm)
+			return;
+	}
+
+	if (unlikely(loaded_mm == &init_mm))
+		return;
+
+	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
+		   loaded_mm->context.ctx_id);
+
+	if (this_cpu_read(cpu_tlbstate_shared.is_lazy)) {
+		switch_mm_irqs_off(NULL, &init_mm, NULL);
+		return;
+	}
+
+	if (unlikely(local_tlb_gen == mm_tlb_gen))
+		goto done;
+
+	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
+	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
+
+	if (f->end != TLB_FLUSH_ALL &&
+	    f->new_tlb_gen == local_tlb_gen + 1 &&
+	    f->new_tlb_gen == mm_tlb_gen) {
+		/* Partial flush */
+		unsigned long addr = f->start;
+
+		VM_WARN_ON(f->new_tlb_gen == TLB_GENERATION_INVALID);
+		VM_WARN_ON(f->mm == NULL);
+
+		nr_invalidate = (f->end - f->start) >> f->stride_shift;
+
+		while (addr < f->end) {
+			flush_tlb_one_user(addr);
+			addr += 1UL << f->stride_shift;
+		}
+		if (local)
+			count_vm_tlb_events(NR_TLB_LOCAL_FLUSH_ONE, nr_invalidate);
+	} else {
+		/* Full flush */
+		nr_invalidate = TLB_FLUSH_ALL;
+		flush_tlb_local();
+		if (local)
+			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+	}
+
+	this_cpu_write(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen, mm_tlb_gen);
+
+done:
+	trace_tlb_flush(!local ? TLB_REMOTE_SHOOTDOWN :
+				(f->mm == NULL) ? TLB_LOCAL_SHOOTDOWN :
+						  TLB_LOCAL_MM_SHOOTDOWN,
+			nr_invalidate);
+#endif
 }
 
 static bool tlb_is_not_lazy(int cpu, void *data)
@@ -948,20 +1207,29 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	 * a local TLB flush is needed. Optimize this use-case by calling
 	 * flush_tlb_func_local() directly in this case.
 	 */
-		if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
-			flush_tlb_multi(mm_cpumask(mm), info);
-		} else {
-			/*
-			 * GEMVISOR DETERMINISM PATCH:
-			 * Avoid branching on cpu_tlbstate.loaded_mm. If this mm is only
-			 * active on the local CPU, doing a local flush is always safe,
-			 * even if the per-CPU loaded_mm state is stale after restore.
-			 */
+	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+		flush_tlb_multi(mm_cpumask(mm), info);
+	} else {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
+		/*
+		 * GEMVISOR DETERMINISM PATCH:
+		 * Avoid branching on cpu_tlbstate.loaded_mm. If this mm is only
+		 * active on the local CPU, doing a local flush is always safe,
+		 * even if the per-CPU loaded_mm state is stale after restore.
+		 */
+		lockdep_assert_irqs_enabled();
+		local_irq_disable();
+		flush_tlb_func(info);
+		local_irq_enable();
+#else
+		if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
 			lockdep_assert_irqs_enabled();
 			local_irq_disable();
 			flush_tlb_func(info);
 			local_irq_enable();
 		}
+#endif
+	}
 
 	put_flush_tlb_info();
 	put_cpu();

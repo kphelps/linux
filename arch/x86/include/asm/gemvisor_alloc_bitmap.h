@@ -15,8 +15,18 @@
 /* Hypercall: register allocation bitmap with the hypervisor. */
 #define GEMVISOR_HC_ALLOC_BITMAP_REGISTER 0x47454D04 /* "GEM\x04" */
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 void gemvisor_alloc_bitmap_mark_alloc(struct page *page, unsigned int order);
 void gemvisor_alloc_bitmap_mark_free_and_scrub(struct page *page, unsigned int order);
+#else
+static inline void gemvisor_alloc_bitmap_mark_alloc(struct page *page,
+						    unsigned int order)
+{
+}
+static inline void gemvisor_alloc_bitmap_mark_free_and_scrub(struct page *page,
+							     unsigned int order)
+{
+}
+#endif
 
 #endif /* _ASM_X86_GEMVISOR_ALLOC_BITMAP_H */
-

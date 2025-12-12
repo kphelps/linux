@@ -3059,8 +3059,10 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
 	 * This matches the eager flush pattern in set_memory.c (patch 004)
 	 * but covers the user-space COW path which was previously missed.
 	 */
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	if (pte_write(entry) && !pte_write(vmf->orig_pte))
 		flush_tlb_page(vma, vmf->address);
+#endif
 
 	/* Trace PTE modification for determinism debugging */
 	gem_trace_pte_modify(vmf->address, pte_val(vmf->orig_pte), pte_val(entry));

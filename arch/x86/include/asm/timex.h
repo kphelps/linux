@@ -7,6 +7,7 @@
 
 static inline unsigned long random_get_entropy(void)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * For deterministic hypervisor execution (gemvisor), return a constant
 	 * value. This disables interrupt-timing-based entropy collection, which
@@ -15,6 +16,12 @@ static inline unsigned long random_get_entropy(void)
 	 * virtio-rng instead.
 	 */
 	return 0;
+#else
+	if (!IS_ENABLED(CONFIG_X86_TSC) &&
+	    !cpu_feature_enabled(X86_FEATURE_TSC))
+		return random_get_entropy_fallback();
+	return rdtsc();
+#endif
 }
 #define random_get_entropy random_get_entropy
 

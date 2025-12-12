@@ -561,6 +561,7 @@ int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 int ptep_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pte_t *ptep)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/*
 	 * GEMVISOR DETERMINISM: never clear Accessed.
 	 *
@@ -569,14 +570,33 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma,
 	 * in paging-structure RAM across snapshots. Report "young" but leave A set.
 	 */
 	return pte_young(*ptep);
+#else
+	int ret = 0;
+
+	if (pte_young(*ptep))
+		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+					 (unsigned long *) &ptep->pte);
+
+	return ret;
+#endif
 }
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG)
 int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pmd_t *pmdp)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: never clear Accessed. */
 	return pmd_young(*pmdp);
+#else
+	int ret = 0;
+
+	if (pmd_young(*pmdp))
+		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+					 (unsigned long *)pmdp);
+
+	return ret;
+#endif
 }
 #endif
 
@@ -584,8 +604,18 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 int pudp_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pud_t *pudp)
 {
+#ifdef CONFIG_GEMVISOR_DETERMINISM
 	/* GEMVISOR DETERMINISM: never clear Accessed. */
 	return pud_young(*pudp);
+#else
+	int ret = 0;
+
+	if (pud_young(*pudp))
+		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+					 (unsigned long *)pudp);
+
+	return ret;
+#endif
 }
 #endif
 
