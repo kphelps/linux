@@ -5,24 +5,63 @@
 #include <linux/threads.h>
 #include <linux/mm.h>		/* for struct page */
 #include <linux/pagemap.h>
+#include <asm/kvm_para.h>
+
+/* GEMVISOR hypercall: tag a PFN as a page-table page. */
+#define GEMVISOR_HC_PGTABLE_TAG 0x47454D05 /* "GEM\x05" */
 
 #define __HAVE_ARCH_PTE_ALLOC_ONE
 #define __HAVE_ARCH_PGD_FREE
 #include <asm-generic/pgalloc.h>
 
-static inline int  __paravirt_pgd_alloc(struct mm_struct *mm) { return 0; }
+static inline int __paravirt_pgd_alloc(struct mm_struct *mm)
+{
+	if (mm && mm->pgd) {
+		unsigned long pfn = __pa(mm->pgd) >> PAGE_SHIFT;
+		kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+		kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn + 1);
+#endif
+	}
+	return 0;
+}
 
 #ifdef CONFIG_PARAVIRT_XXL
 #include <asm/paravirt.h>
 #else
 #define paravirt_pgd_alloc(mm)	__paravirt_pgd_alloc(mm)
 static inline void paravirt_pgd_free(struct mm_struct *mm, pgd_t *pgd) {}
-static inline void paravirt_alloc_pte(struct mm_struct *mm, unsigned long pfn)	{}
-static inline void paravirt_alloc_pmd(struct mm_struct *mm, unsigned long pfn)	{}
+
+/*
+ * GEMVISOR DETERMINISM PATCH:
+ * Notify the hypervisor when a PFN is used as a page-table page.
+ *
+ * These hooks run when page-table pages are linked into the active hierarchy.
+ * Tagging at link-time avoids host-side heuristics and ensures A/D updates on
+ * newly allocated page tables never fault nondeterministically.
+ */
+static inline void paravirt_alloc_pte(struct mm_struct *mm, unsigned long pfn)
+{
+	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+}
+static inline void paravirt_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
+{
+	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+}
 static inline void paravirt_alloc_pmd_clone(unsigned long pfn, unsigned long clonepfn,
-					    unsigned long start, unsigned long count) {}
-static inline void paravirt_alloc_pud(struct mm_struct *mm, unsigned long pfn)	{}
-static inline void paravirt_alloc_p4d(struct mm_struct *mm, unsigned long pfn)	{}
+					    unsigned long start, unsigned long count)
+{
+	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, clonepfn);
+}
+static inline void paravirt_alloc_pud(struct mm_struct *mm, unsigned long pfn)
+{
+	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+}
+static inline void paravirt_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
+{
+	kvm_hypercall1(GEMVISOR_HC_PGTABLE_TAG, pfn);
+}
 static inline void paravirt_release_pte(unsigned long pfn) {}
 static inline void paravirt_release_pmd(unsigned long pfn) {}
 static inline void paravirt_release_pud(unsigned long pfn) {}

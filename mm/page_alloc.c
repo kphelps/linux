@@ -564,7 +564,6 @@ static inline bool pcp_allowed_order(unsigned int order)
 
 static inline void free_the_page(struct page *page, unsigned int order)
 {
-	gemvisor_alloc_bitmap_mark_free_and_scrub(page, order);
 	if (pcp_allowed_order(order))		/* Via pcp? */
 		free_unref_page(page, order);
 	else
@@ -1272,6 +1271,12 @@ static void __free_pages_ok(struct page *page, unsigned int order,
 
 	if (!free_pages_prepare(page, order, fpi_flags))
 		return;
+
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Mark this PFN range free and scrub to zero for deterministic pruning.
+	 */
+	gemvisor_alloc_bitmap_mark_free_and_scrub(page, order);
 
 	/*
 	 * Calling get_pfnblock_migratetype() without spin_lock_irqsave() here
@@ -2417,6 +2422,13 @@ void free_unref_page(struct page *page, unsigned int order)
 
 	if (!free_unref_page_prepare(page, pfn, order))
 		return;
+
+	/*
+	 * GEMVISOR DETERMINISM PATCH:
+	 * Mark this PFN range free and scrub to zero. Doing this after the
+	 * preparatory checks avoids corrupting allocator state on invalid frees.
+	 */
+	gemvisor_alloc_bitmap_mark_free_and_scrub(page, order);
 
 	/*
 	 * We only track unmovable, reclaimable and movable on pcp lists.
