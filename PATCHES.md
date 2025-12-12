@@ -163,7 +163,7 @@ With the IO port approach:
 **File Modified:** `arch/x86/include/asm/debugreg.h`
 
 **Change:**
-Force `hw_breakpoint_active()` to always return false:
+Force `hw_breakpoint_active()` to always return false when `CONFIG_GEMVISOR_DETERMINISM=y`:
 
 ```diff
  static __always_inline bool hw_breakpoint_active(void)
@@ -183,8 +183,13 @@ During text-patching and other sensitive paths (e.g., `text_poke()` via `use_tem
 By forcing the “no breakpoints active” path, the guest always takes the same instruction sequence.
 
 **Impact:**
-- Hardware watchpoints / breakpoints are effectively disabled in the guest.
-- Tools relying on DR registers (GDB HW watchpoints, perf HW breakpoints, KGDB) will not work.
+- Hardware watchpoints / breakpoints are effectively disabled in determinism builds.
+- The following guest features will not work with `CONFIG_GEMVISOR_DETERMINISM=y`:
+  - GDB hardware watchpoints / breakpoints (DR0–DR7)
+  - perf hardware breakpoint events
+  - KGDB/KDB hardware breakpoints
+  - ptrace DR register access (PEEKUSR/POKEUSR)
+- Use software watchpoints instead, or rebuild with `CONFIG_GEMVISOR_DETERMINISM=n` if you need DR‑based debugging (at the cost of determinism guarantees).
 - Deterministic text‑patching paths no longer depend on per‑CPU debug state.
 
 ## 7. Deterministic CR4 Shadow Updates
