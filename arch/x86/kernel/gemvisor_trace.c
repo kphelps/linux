@@ -337,7 +337,6 @@ void gemvisor_trace_emit(u16 event_type, u32 flags, const void *payload, u8 payl
 {
 	gemvisor_trace_emit_regs(event_type, flags, payload, payload_len, NULL);
 }
-EXPORT_SYMBOL_GPL(gemvisor_trace_emit);
 
 /*
  * Collect extended page fault context for debugging.
