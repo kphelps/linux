@@ -723,14 +723,10 @@ static void flush_tlb_func(void *info)
 	/* This code cannot presently handle being reentered. */
 	VM_WARN_ON(!irqs_disabled());
 
-	if (!local) {
-		inc_irq_stat(irq_tlb_count);
-		count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
-
-		/* Can only happen on remote CPUs */
-		if (f->mm && f->mm != loaded_mm)
-			return;
-	}
+		if (!local) {
+			inc_irq_stat(irq_tlb_count);
+			count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
+		}
 
 	/*
 	 * GEMVISOR DETERMINISM PATCH:
@@ -770,21 +766,10 @@ static void flush_tlb_func(void *info)
 		return;
 	}
 
-	if (unlikely(f->new_tlb_gen != TLB_GENERATION_INVALID &&
-		     f->new_tlb_gen <= local_tlb_gen)) {
 		/*
-		 * The TLB is already up to date in respect to f->new_tlb_gen.
-		 * While the core might be still behind mm_tlb_gen, checking
-		 * mm_tlb_gen unnecessarily would have negative caching effects
-		 * so avoid it.
+		 * Defer mm_tlb_gen reading as long as possible to avoid cache
+		 * contention.
 		 */
-		return;
-	}
-
-	/*
-	 * Defer mm_tlb_gen reading as long as possible to avoid cache
-	 * contention.
-	 */
 	mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
 
 	if (unlikely(local_tlb_gen == mm_tlb_gen))
@@ -963,14 +948,20 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	 * a local TLB flush is needed. Optimize this use-case by calling
 	 * flush_tlb_func_local() directly in this case.
 	 */
-	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
-		flush_tlb_multi(mm_cpumask(mm), info);
-	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
-		lockdep_assert_irqs_enabled();
-		local_irq_disable();
-		flush_tlb_func(info);
-		local_irq_enable();
-	}
+		if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+			flush_tlb_multi(mm_cpumask(mm), info);
+		} else {
+			/*
+			 * GEMVISOR DETERMINISM PATCH:
+			 * Avoid branching on cpu_tlbstate.loaded_mm. If this mm is only
+			 * active on the local CPU, doing a local flush is always safe,
+			 * even if the per-CPU loaded_mm state is stale after restore.
+			 */
+			lockdep_assert_irqs_enabled();
+			local_irq_disable();
+			flush_tlb_func(info);
+			local_irq_enable();
+		}
 
 	put_flush_tlb_info();
 	put_cpu();
