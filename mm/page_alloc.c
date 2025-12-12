@@ -53,6 +53,7 @@
 #include <linux/khugepaged.h>
 #include <linux/delayacct.h>
 #include <asm/div64.h>
+#include <asm/gemvisor_alloc_bitmap.h>
 #include "internal.h"
 #include "shuffle.h"
 #include "page_reporting.h"
@@ -563,6 +564,7 @@ static inline bool pcp_allowed_order(unsigned int order)
 
 static inline void free_the_page(struct page *page, unsigned int order)
 {
+	gemvisor_alloc_bitmap_mark_free_and_scrub(page, order);
 	if (pcp_allowed_order(order))		/* Via pcp? */
 		free_unref_page(page, order);
 	else
@@ -4455,6 +4457,8 @@ out:
 
 	trace_mm_page_alloc(page, order, alloc_gfp, ac.migratetype);
 	kmsan_alloc_page(page, order, alloc_gfp);
+	if (page)
+		gemvisor_alloc_bitmap_mark_alloc(page, order);
 
 	return page;
 }
