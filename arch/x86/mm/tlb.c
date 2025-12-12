@@ -348,7 +348,7 @@ void leave_mm(int cpu)
 EXPORT_SYMBOL_GPL(leave_mm);
 
 void switch_mm(struct mm_struct *prev, struct mm_struct *next,
-	       struct task_struct *tsk)
+		struct task_struct *tsk)
 {
 	unsigned long flags;
 
@@ -448,6 +448,16 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * lazy TLB mode) that are now bypassed for determinism.
 	 */
 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+	/*
+	 * Use the scheduler-provided prev mm for cpumask tracking.
+	 *
+	 * real_prev comes from per-CPU cpu_tlbstate.loaded_mm, which can legitimately
+	 * differ between identical VMs after snapshot/restore. Branching on or using
+	 * that value for mm_cpumask operations can create divergence. The prev/next
+	 * arguments are derived from the task switch and are determinism-critical
+	 * inputs, so they are the right source of truth here.
+	 */
+	struct mm_struct *cpumask_prev = prev ? prev : &init_mm;
 	unsigned cpu = smp_processor_id();
 	unsigned long new_lam;
 	u64 next_tlb_gen;
@@ -535,23 +545,19 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	cond_mitigation(tsk);
 
 	/*
-	 * GEMVISOR DETERMINISM PATCH:
-	 * Always execute cpumask operations unconditionally to avoid divergence.
-	 * The original code had `if (real_prev != &init_mm)` which causes
-	 * different instruction counts when real_prev differs between VMs.
+	 * Restore the upstream init_mm guards for safety: init_mm is a global kernel
+	 * address space and its cpumask is not used for user TLB shootdowns. We must
+	 * not mutate it during kernel-thread transitions.
 	 *
-	 * We check for init_mm and always take the same code path regardless:
-	 * - If real_prev is init_mm: cpumask_clear_cpu is a no-op (init_mm's
-	 *   cpumask is never used for IPIs anyway)
-	 * - If real_prev is not init_mm: cpumask_clear_cpu does the right thing
-	 *
-	 * Similarly for next: we always do cpumask_set_cpu to ensure identical
-	 * instruction sequences.
+	 * Determinism note: We guard based on cpumask_prev/next (scheduler inputs),
+	 * not real_prev (per-CPU state), so identical runs take identical branches.
 	 */
-	cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
+	if (cpumask_prev != &init_mm)
+		cpumask_clear_cpu(cpu, mm_cpumask(cpumask_prev));
 
 	/* Start receiving IPIs and then read tlb_gen (and LAM below) */
-	cpumask_set_cpu(cpu, mm_cpumask(next));
+	if (next != &init_mm)
+		cpumask_set_cpu(cpu, mm_cpumask(next));
 	next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 
 	choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
