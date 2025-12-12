@@ -57,8 +57,8 @@ static void delay_loop(u64 __loops);
  * Calibration and selection of the delay mechanism happens only once
  * during boot.
  */
-static void (*delay_fn)(u64) __ro_after_init = delay_loop;
-static void (*delay_halt_fn)(u64 start, u64 cycles) __ro_after_init;
+static void (*delay_fn)(u64) __ro_after_init __maybe_unused = delay_loop;
+static void (*delay_halt_fn)(u64 start, u64 cycles) __ro_after_init __maybe_unused;
 
 /* simple loop based delay: */
 static void delay_loop(u64 __loops)
@@ -83,6 +83,7 @@ static void delay_loop(u64 __loops)
 	);
 }
 
+#ifndef CONFIG_GEMVISOR_DETERMINISM
 /* TSC based delay: */
 static void delay_tsc(u64 cycles)
 {
@@ -197,6 +198,7 @@ static void delay_halt(u64 __cycles)
 
 void __init use_tsc_delay(void)
 {
+	/* Gemvisor deterministic builds ignore delay_fn entirely. */
 	if (delay_fn == delay_loop)
 		delay_fn = delay_tsc;
 }
@@ -221,6 +223,14 @@ int read_current_timer(unsigned long *timer_val)
 	}
 	return -1;
 }
+#endif /* !CONFIG_GEMVISOR_DETERMINISM */
+
+#ifdef CONFIG_GEMVISOR_DETERMINISM
+void __init use_tsc_delay(void) { }
+void __init use_tpause_delay(void) { }
+void use_mwaitx_delay(void) { }
+int read_current_timer(unsigned long *timer_val) { return -1; }
+#endif
 
 void __delay(unsigned long loops)
 {
