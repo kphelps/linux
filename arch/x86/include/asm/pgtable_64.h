@@ -64,6 +64,10 @@ void set_pte_vaddr_pud(pud_t *pud_page, unsigned long vaddr, pte_t new_pte);
 
 static inline void native_set_pte(pte_t *ptep, pte_t pte)
 {
+	/* GEMVISOR OBSERVABILITY: trace all low-level PTE writes (skip preboot). */
+#ifndef __DISABLE_EXPORTS
+	gem_trace_pte_modify((unsigned long)ptep, pte_val(*ptep), pte_val(pte));
+#endif
 	WRITE_ONCE(*ptep, pte);
 }
 
@@ -75,11 +79,19 @@ static inline void native_pte_clear(struct mm_struct *mm, unsigned long addr,
 
 static inline void native_set_pte_atomic(pte_t *ptep, pte_t pte)
 {
+	/* GEMVISOR OBSERVABILITY: trace atomic PTE writes (skip preboot). */
+#ifndef __DISABLE_EXPORTS
+	gem_trace_pte_modify((unsigned long)ptep, pte_val(*ptep), pte_val(pte));
+#endif
 	native_set_pte(ptep, pte);
 }
 
 static inline void native_set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
+	/* GEMVISOR OBSERVABILITY: trace all low-level PMD writes (skip preboot). */
+#ifndef __DISABLE_EXPORTS
+	gem_trace_pte_modify((unsigned long)pmdp, pmd_val(*pmdp), pmd_val(pmd));
+#endif
 	WRITE_ONCE(*pmdp, pmd);
 }
 
@@ -116,6 +128,10 @@ static inline pmd_t native_pmdp_get_and_clear(pmd_t *xp)
 
 static inline void native_set_pud(pud_t *pudp, pud_t pud)
 {
+	/* GEMVISOR OBSERVABILITY: trace all low-level PUD writes (skip preboot). */
+#ifndef __DISABLE_EXPORTS
+	gem_trace_pte_modify((unsigned long)pudp, pud_val(*pudp), pud_val(pud));
+#endif
 	WRITE_ONCE(*pudp, pud);
 }
 

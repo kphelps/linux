@@ -21,6 +21,9 @@
 #include <asm/pkru.h>
 #include <asm/fpu/api.h>
 #include <asm/coco.h>
+#ifndef __DISABLE_EXPORTS
+#include <asm/gemvisor_trace.h>
+#endif
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
 
@@ -408,7 +411,8 @@ static inline pte_t pte_mkclean(pte_t pte)
 
 static inline pte_t pte_mkold(pte_t pte)
 {
-	return pte_clear_flags(pte, _PAGE_ACCESSED);
+	/* GEMVISOR DETERMINISM: never clear Accessed to avoid A-bit drift. */
+	return pte;
 }
 
 static inline pte_t pte_mkexec(pte_t pte)
@@ -437,7 +441,8 @@ static inline pte_t pte_mkyoung(pte_t pte)
 
 static inline pte_t pte_mkwrite_novma(pte_t pte)
 {
-	return pte_set_flags(pte, _PAGE_RW);
+	/* GEMVISOR DETERMINISM: writable mappings start Dirty. */
+	return pte_set_flags(pte, _PAGE_RW | _PAGE_DIRTY);
 }
 
 struct vm_area_struct;
@@ -537,7 +542,8 @@ static inline pmd_t pmd_clear_uffd_wp(pmd_t pmd)
 
 static inline pmd_t pmd_mkold(pmd_t pmd)
 {
-	return pmd_clear_flags(pmd, _PAGE_ACCESSED);
+	/* GEMVISOR DETERMINISM: never clear Accessed to avoid A-bit drift. */
+	return pmd;
 }
 
 static inline pmd_t pmd_mkclean(pmd_t pmd)
@@ -576,7 +582,8 @@ static inline pmd_t pmd_mkyoung(pmd_t pmd)
 
 static inline pmd_t pmd_mkwrite_novma(pmd_t pmd)
 {
-	return pmd_set_flags(pmd, _PAGE_RW);
+	/* GEMVISOR DETERMINISM: writable mappings start Dirty. */
+	return pmd_set_flags(pmd, _PAGE_RW | _PAGE_DIRTY);
 }
 
 pmd_t pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma);
@@ -616,7 +623,8 @@ static inline pud_t pud_clear_saveddirty(pud_t pud)
 
 static inline pud_t pud_mkold(pud_t pud)
 {
-	return pud_clear_flags(pud, _PAGE_ACCESSED);
+	/* GEMVISOR DETERMINISM: never clear Accessed to avoid A-bit drift. */
+	return pud;
 }
 
 static inline pud_t pud_mkclean(pud_t pud)
@@ -660,7 +668,8 @@ static inline pud_t pud_mkyoung(pud_t pud)
 
 static inline pud_t pud_mkwrite(pud_t pud)
 {
-	pud = pud_set_flags(pud, _PAGE_RW);
+	/* GEMVISOR DETERMINISM: writable mappings start Dirty. */
+	pud = pud_set_flags(pud, _PAGE_RW | _PAGE_DIRTY);
 
 	return pud_clear_saveddirty(pud);
 }
@@ -747,25 +756,53 @@ static inline pgprotval_t check_pgprot(pgprot_t pgprot)
 static inline pte_t pfn_pte(unsigned long page_nr, pgprot_t pgprot)
 {
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
+	pgprotval_t flags = check_pgprot(pgprot);
+
+	/*
+	 * GEMVISOR DETERMINISM: Canonicalize paging A/D bits.
+	 *
+	 * The CPU may lazily set Accessed/Dirty bits in guest page tables at
+	 * microarchitecturally variable times. Install present mappings with
+	 * A=1 always, and D=1 whenever the PTE is writable, so hardware never
+	 * needs to update these bits later.
+	 */
+	flags |= _PAGE_ACCESSED;
+	if (flags & _PAGE_RW)
+		flags |= _PAGE_DIRTY;
+
 	pfn ^= protnone_mask(pgprot_val(pgprot));
 	pfn &= PTE_PFN_MASK;
-	return __pte(pfn | check_pgprot(pgprot));
+	return __pte(pfn | flags);
 }
 
 static inline pmd_t pfn_pmd(unsigned long page_nr, pgprot_t pgprot)
 {
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
+	pgprotval_t flags = check_pgprot(pgprot);
+
+	/* See pfn_pte() determinism note above. */
+	flags |= _PAGE_ACCESSED;
+	if (flags & _PAGE_RW)
+		flags |= _PAGE_DIRTY;
+
 	pfn ^= protnone_mask(pgprot_val(pgprot));
 	pfn &= PHYSICAL_PMD_PAGE_MASK;
-	return __pmd(pfn | check_pgprot(pgprot));
+	return __pmd(pfn | flags);
 }
 
 static inline pud_t pfn_pud(unsigned long page_nr, pgprot_t pgprot)
 {
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
+	pgprotval_t flags = check_pgprot(pgprot);
+
+	/* See pfn_pte() determinism note above. */
+	flags |= _PAGE_ACCESSED;
+	if (flags & _PAGE_RW)
+		flags |= _PAGE_DIRTY;
+
 	pfn ^= protnone_mask(pgprot_val(pgprot));
 	pfn &= PHYSICAL_PUD_PAGE_MASK;
-	return __pud(pfn | check_pgprot(pgprot));
+	return __pud(pfn | flags);
 }
 
 static inline pmd_t pmd_mkinvalid(pmd_t pmd)
@@ -1226,16 +1263,31 @@ static inline pud_t native_local_pudp_get_and_clear(pud_t *pudp)
 }
 
 static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
-			      pmd_t *pmdp, pmd_t pmd)
+				      pmd_t *pmdp, pmd_t pmd)
 {
 	page_table_check_pmd_set(mm, pmdp, pmd);
+	/*
+	 * GEMVISOR DETERMINISM/OBSERVABILITY:
+	 * Trace every PMD update as a PteModify guest event so paired runs can
+	 * detect PFN/flag divergence at the exact modification site.
+	 */
+#ifndef __DISABLE_EXPORTS
+	gem_trace_pte_modify(addr, pmd_val(*pmdp), pmd_val(pmd));
+#endif
 	set_pmd(pmdp, pmd);
 }
 
 static inline void set_pud_at(struct mm_struct *mm, unsigned long addr,
-			      pud_t *pudp, pud_t pud)
+				      pud_t *pudp, pud_t pud)
 {
 	page_table_check_pud_set(mm, pudp, pud);
+	/*
+	 * GEMVISOR DETERMINISM/OBSERVABILITY:
+	 * Trace every PUD update as a PteModify guest event.
+	 */
+#ifndef __DISABLE_EXPORTS
+	gem_trace_pte_modify(addr, pud_val(*pudp), pud_val(pud));
+#endif
 	native_set_pud(pudp, pud);
 }
 
