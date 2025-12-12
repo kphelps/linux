@@ -156,21 +156,23 @@ With the IO port approach:
 - IO writes to port 0x510 advance vtime by the written nanoseconds value
 - Supports both 4-byte (u32) and 8-byte (u64) writes
 
-## 6. Disable Hardware Breakpoint Activity Checks
+## 6. Deterministic Hardware Breakpoint Activity Checks
 
 **Kernel Version:** 6.6.61
 
 **File Modified:** `arch/x86/include/asm/debugreg.h`
 
 **Change:**
-Force `hw_breakpoint_active()` to always return false when `CONFIG_GEMVISOR_DETERMINISM=y`:
+When `CONFIG_GEMVISOR_DETERMINISM=y`, derive `hw_breakpoint_active()` from the hardware DR7
+value instead of the per‑CPU `cpu_dr7` shadow:
 
 ```diff
  static __always_inline bool hw_breakpoint_active(void)
  {
--	return this_cpu_read(cpu_dr7) & DR7_ACTIVE_MASK;
-+	/* GEMVISOR: force deterministic path */
-+	return false;
++	unsigned long dr7;
++
++	get_debugreg(dr7, 7);
++	return dr7 & DR_GLOBAL_ENABLE_MASK;
  }
 ```
 
@@ -180,17 +182,13 @@ During text-patching and other sensitive paths (e.g., `text_poke()` via `use_tem
 - Different branch decisions (disable vs. skip disable)
 - Different instruction counts and debug‑register side effects
 
-By forcing the “no breakpoints active” path, the guest always takes the same instruction sequence.
+By tying the decision to DR7 (which the hypervisor snapshots/restores deterministically), the guest
+always takes the same instruction sequence across restores without disabling breakpoints.
 
 **Impact:**
-- Hardware watchpoints / breakpoints are effectively disabled in determinism builds.
-- The following guest features will not work with `CONFIG_GEMVISOR_DETERMINISM=y`:
-  - GDB hardware watchpoints / breakpoints (DR0–DR7)
-  - perf hardware breakpoint events
-  - KGDB/KDB hardware breakpoints
-  - ptrace DR register access (PEEKUSR/POKEUSR)
-- Use software watchpoints instead, or rebuild with `CONFIG_GEMVISOR_DETERMINISM=n` if you need DR‑based debugging (at the cost of determinism guarantees).
-- Deterministic text‑patching paths no longer depend on per‑CPU debug state.
+- Hardware watchpoints/breakpoints remain available in determinism builds.
+- Text‑patching paths no longer depend on per‑CPU debug shadows, eliminating restore divergence.
+- Small performance cost from an extra DR7 read on each check.
 
 ## 7. Deterministic CR4 Shadow Updates
 
