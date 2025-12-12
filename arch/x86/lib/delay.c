@@ -226,10 +226,34 @@ void __delay(unsigned long loops)
 	 *
 	 * loops_per_jiffy corresponds to 1/HZ seconds worth of loops.
 	 * ns = loops * (1e9 / HZ) / lpj
+	 *
+	 * Use 64-bit arithmetic to avoid overflow, guard lpj==0 during early boot,
+	 * and emit long delays in u32-sized chunks because the delay port is 32-bit.
 	 */
-	unsigned long ns = (loops * (1000000000UL / HZ)) / loops_per_jiffy;
-	if (ns > 0)
-		gemvisor_delay_ns(ns);
+	unsigned long lpj = this_cpu_read(cpu_info.loops_per_jiffy) ? : loops_per_jiffy;
+	u64 ns_per_jiffy = 1000000000ULL / HZ;
+	u64 ns;
+
+	if (!lpj) {
+		/*
+		 * loops_per_jiffy isn't calibrated yet. Fall back to the raw loop so
+		 * callers still observe a delay.
+		 */
+		delay_loop(loops);
+		return;
+	}
+
+	if (loops > U64_MAX / ns_per_jiffy)
+		ns = U64_MAX;
+	else
+		ns = (u64)loops * ns_per_jiffy;
+	ns = div_u64(ns, lpj);
+
+	while (ns) {
+		u32 chunk = ns > U32_MAX ? U32_MAX : (u32)ns;
+		gemvisor_delay_ns(chunk);
+		ns -= chunk;
+	}
 }
 EXPORT_SYMBOL(__delay);
 
