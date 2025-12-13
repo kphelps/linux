@@ -7057,6 +7057,38 @@ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
  * User-managed MMU ioctl handlers for KVM_MEM_USERMMU memslots.
  */
 
+static int kvm_usermmu_ensure_tdp_root(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	int ret;
+
+	if (!tdp_mmu_enabled)
+		return 0;
+
+	/*
+	 * User-managed MMU mappings can be installed before the first KVM_RUN,
+	 * e.g. during snapshot restore. TDP MMU roots are created lazily on
+	 * mmu_load, so ensure at least one vCPU has a valid root before
+	 * attempting to install user-managed mappings. Otherwise, the USERMMU
+	 * ioctls will succeed but silently fail to create SPTEs because there
+	 * are no TDP roots to update.
+	 */
+	vcpu = kvm_get_vcpu(kvm, 0);
+	if (!vcpu)
+		return -EINVAL;
+
+	if (VALID_PAGE(vcpu->arch.mmu->root.hpa))
+		return 0;
+
+	mutex_lock(&vcpu->mutex);
+	vcpu_load(vcpu);
+	ret = kvm_mmu_load(vcpu);
+	vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+
+	return ret;
+}
+
 static int kvm_vm_ioctl_map_gpa_range(struct kvm *kvm,
 				      struct kvm_gpa_mapping *mapping)
 {
@@ -7087,6 +7119,10 @@ static int kvm_vm_ioctl_map_gpa_range(struct kvm *kvm,
 		return -EINVAL;
 	if (slot->id != mapping->slot)
 		return -EINVAL;
+
+	ret = kvm_usermmu_ensure_tdp_root(kvm);
+	if (ret)
+		return ret;
 
 	/* Allocate array for page pointers */
 	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL_ACCOUNT);
@@ -7491,6 +7527,10 @@ static int kvm_vm_ioctl_map_gpa_batch(struct kvm *kvm,
 		ret = -EINVAL;
 		goto out_free_entries;
 	}
+
+	ret = kvm_usermmu_ensure_tdp_root(kvm);
+	if (ret)
+		goto out_free_entries;
 
 	/* Validate all entries and allocate page array */
 	pages = kvmalloc_array(nmappings, sizeof(*pages), GFP_KERNEL_ACCOUNT);
