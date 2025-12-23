@@ -57,6 +57,8 @@
 #include <crypto/chacha.h>
 #include <crypto/blake2s.h>
 #include <asm/archrandom.h>
+#include <asm/gemvisor.h>
+#include <asm/io.h>
 #include <asm/processor.h>
 #include <asm/irq.h>
 #include <asm/irq_regs.h>
@@ -1361,6 +1363,49 @@ static void __cold try_to_generate_entropy(void)
  *
  **********************************************************************/
 
+static inline long gemvisor_rng_read(void *buf, size_t len)
+{
+	size_t dwords = len >> 2;
+	size_t tail = len & 0x3;
+	u8 *cursor = buf;
+
+	if (len == 0)
+		return 0;
+
+	if (dwords)
+		insl(GEMVISOR_RNG_PORT, cursor, dwords);
+	if (tail)
+		insb(GEMVISOR_RNG_PORT, cursor + (dwords << 2), tail);
+
+	return (long)len;
+}
+
+static ssize_t gemvisor_rng_read_iter(struct iov_iter *iter)
+{
+	u8 block[1024];
+	size_t remaining = iov_iter_count(iter);
+	ssize_t total = 0;
+
+	while (remaining) {
+		size_t chunk = min_t(size_t, remaining, sizeof(block));
+		long ret = gemvisor_rng_read(block, chunk);
+
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			break;
+		if (copy_to_iter(block, (size_t)ret, iter) != (size_t)ret)
+			return -EFAULT;
+		total += ret;
+		remaining -= (size_t)ret;
+		if (signal_pending(current))
+			break;
+		cond_resched();
+	}
+
+	return total;
+}
+
 SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags)
 {
 	struct iov_iter iter;
@@ -1377,18 +1422,10 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 	if ((flags & (GRND_INSECURE | GRND_RANDOM)) == (GRND_INSECURE | GRND_RANDOM))
 		return -EINVAL;
 
-	if (!crng_ready() && !(flags & GRND_INSECURE)) {
-		if (flags & GRND_NONBLOCK)
-			return -EAGAIN;
-		ret = wait_for_random_bytes();
-		if (unlikely(ret))
-			return ret;
-	}
-
 	ret = import_single_range(ITER_DEST, ubuf, len, &iov, &iter);
 	if (unlikely(ret))
 		return ret;
-	return get_random_bytes_user(&iter);
+	return gemvisor_rng_read_iter(&iter);
 }
 
 static __poll_t random_poll(struct file *file, poll_table *wait)
@@ -1432,26 +1469,7 @@ static ssize_t random_write_iter(struct kiocb *kiocb, struct iov_iter *iter)
 
 static ssize_t urandom_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
 {
-	static int maxwarn = 10;
-
-	/*
-	 * Opportunistically attempt to initialize the RNG on platforms that
-	 * have fast cycle counters, but don't (for now) require it to succeed.
-	 */
-	if (!crng_ready())
-		try_to_generate_entropy();
-
-	if (!crng_ready()) {
-		if (!ratelimit_disable && maxwarn <= 0)
-			++urandom_warning.missed;
-		else if (ratelimit_disable || __ratelimit(&urandom_warning)) {
-			--maxwarn;
-			pr_notice("%s: uninitialized urandom read (%zu bytes read)\n",
-				  current->comm, iov_iter_count(iter));
-		}
-	}
-
-	return get_random_bytes_user(iter);
+	return gemvisor_rng_read_iter(iter);
 }
 
 static ssize_t random_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
