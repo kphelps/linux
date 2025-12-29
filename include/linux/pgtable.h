@@ -16,9 +16,7 @@
 #include <linux/errno.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
-#ifndef __DISABLE_EXPORTS
 #include <asm/gemvisor_trace.h>
-#endif
 
 #if 5 - defined(__PAGETABLE_P4D_FOLDED) - defined(__PAGETABLE_PUD_FOLDED) - \
 	defined(__PAGETABLE_PMD_FOLDED) != CONFIG_PGTABLE_LEVELS
@@ -240,9 +238,7 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
 
 	arch_enter_lazy_mmu_mode();
 	for (;;) {
-#ifndef __DISABLE_EXPORTS
 		gem_trace_pte_modify(cur_addr, pte_val(*ptep), pte_val(pte));
-#endif
 		set_pte(ptep, pte);
 		if (--nr == 0)
 			break;

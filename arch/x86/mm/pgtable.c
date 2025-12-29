@@ -502,11 +502,8 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 {
 	int changed = !pte_same(*ptep, entry);
 
-	if (changed && dirty) {
-		/* GEMVISOR: trace direct PTE writes not using set_pte_at(). */
-		gem_trace_pte_modify(address, pte_val(*ptep), pte_val(entry));
+	if (changed && dirty)
 		set_pte(ptep, entry);
-	}
 
 	return changed;
 }
@@ -521,8 +518,6 @@ int pmdp_set_access_flags(struct vm_area_struct *vma,
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
 	if (changed && dirty) {
-		/* GEMVISOR: trace direct PMD writes not using set_pmd_at(). */
-		gem_trace_pte_modify(address, pmd_val(*pmdp), pmd_val(entry));
 		set_pmd(pmdp, entry);
 		/*
 		 * We had a write-protection fault here and changed the pmd
@@ -543,8 +538,6 @@ int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 	VM_BUG_ON(address & ~HPAGE_PUD_MASK);
 
 	if (changed && dirty) {
-		/* GEMVISOR: trace direct PUD writes not using set_pud_at(). */
-		gem_trace_pte_modify(address, pud_val(*pudp), pud_val(entry));
 		set_pud(pudp, entry);
 		/*
 		 * We had a write-protection fault here and changed the pud
@@ -561,16 +554,6 @@ int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 int ptep_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pte_t *ptep)
 {
-#ifdef CONFIG_GEMVISOR_DETERMINISM
-	/*
-	 * GEMVISOR DETERMINISM: never clear Accessed.
-	 *
-	 * Clearing A bits allows the CPU to lazily re-set them later, which can
-	 * happen at microarchitecturally variable times and cause silent drift
-	 * in paging-structure RAM across snapshots. Report "young" but leave A set.
-	 */
-	return pte_young(*ptep);
-#else
 	int ret = 0;
 
 	if (pte_young(*ptep))
@@ -578,17 +561,12 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma,
 					 (unsigned long *) &ptep->pte);
 
 	return ret;
-#endif
 }
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG)
 int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pmd_t *pmdp)
 {
-#ifdef CONFIG_GEMVISOR_DETERMINISM
-	/* GEMVISOR DETERMINISM: never clear Accessed. */
-	return pmd_young(*pmdp);
-#else
 	int ret = 0;
 
 	if (pmd_young(*pmdp))
@@ -596,7 +574,6 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 					 (unsigned long *)pmdp);
 
 	return ret;
-#endif
 }
 #endif
 
@@ -604,10 +581,6 @@ int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 int pudp_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pud_t *pudp)
 {
-#ifdef CONFIG_GEMVISOR_DETERMINISM
-	/* GEMVISOR DETERMINISM: never clear Accessed. */
-	return pud_young(*pudp);
-#else
 	int ret = 0;
 
 	if (pud_young(*pudp))
@@ -615,7 +588,6 @@ int pudp_test_and_clear_young(struct vm_area_struct *vma,
 					 (unsigned long *)pudp);
 
 	return ret;
-#endif
 }
 #endif
 
