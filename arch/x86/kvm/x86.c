@@ -116,7 +116,11 @@ static u64 __read_mostly efer_reserved_bits = ~((u64)EFER_SCE);
 
 static u64 __read_mostly cr4_reserved_bits = CR4_RESERVED_BITS;
 
-#define KVM_EXIT_HYPERCALL_VALID_MASK (1 << KVM_HC_MAP_GPA_RANGE)
+#define KVM_EXIT_HYPERCALL_GEMVISOR (1U << 30)
+#define KVM_EXIT_HYPERCALL_VALID_MASK \
+	((1ULL << KVM_HC_MAP_GPA_RANGE) | KVM_EXIT_HYPERCALL_GEMVISOR)
+#define GEMVISOR_HYPERCALL_PREFIX 0x47454D00U
+#define GEMVISOR_HYPERCALL_MASK 0xFFFFFF00U
 
 #define KVM_CAP_PMU_VALID_MASK KVM_PMU_CAP_DISABLE
 
@@ -7303,6 +7307,12 @@ static int kvm_vm_ioctl_unmap_gpa_range(struct kvm *kvm,
 	return 0;
 }
 
+static int kvm_vm_ioctl_flush_gpa_tlbs(struct kvm *kvm)
+{
+	kvm_flush_remote_tlbs(kvm);
+	return 0;
+}
+
 /*
  * Helper to find a USERMMU region by ID within a slot.
  */
@@ -8037,6 +8047,9 @@ set_pit2_out:
 		r = kvm_vm_ioctl_unmap_gpa_range(kvm, &unmap);
 		break;
 	}
+	case KVM_FLUSH_GPA_TLBS:
+		r = kvm_vm_ioctl_flush_gpa_tlbs(kvm);
+		break;
 	case KVM_MAP_GPA_BATCH:
 		r = kvm_vm_ioctl_map_gpa_batch(kvm, argp);
 		break;
@@ -10825,6 +10838,26 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 	if (static_call(kvm_x86_get_cpl)(vcpu) != 0) {
 		ret = -KVM_EPERM;
 		goto out;
+	}
+
+	if (vcpu->kvm->arch.hypercall_exit_enabled & KVM_EXIT_HYPERCALL_GEMVISOR) {
+		if ((nr & GEMVISOR_HYPERCALL_MASK) == GEMVISOR_HYPERCALL_PREFIX) {
+			vcpu->run->exit_reason        = KVM_EXIT_HYPERCALL;
+			vcpu->run->hypercall.nr       = nr;
+			vcpu->run->hypercall.args[0]  = a0;
+			vcpu->run->hypercall.args[1]  = a1;
+			vcpu->run->hypercall.args[2]  = a2;
+			vcpu->run->hypercall.args[3]  = a3;
+			vcpu->run->hypercall.args[4]  = 0;
+			vcpu->run->hypercall.args[5]  = 0;
+			vcpu->run->hypercall.flags    = 0;
+			if (op_64_bit)
+				vcpu->run->hypercall.flags |= KVM_EXIT_HYPERCALL_LONG_MODE;
+
+			WARN_ON_ONCE(vcpu->run->hypercall.flags & KVM_EXIT_HYPERCALL_MBZ);
+			vcpu->arch.complete_userspace_io = complete_hypercall_exit;
+			return 0;
+		}
 	}
 
 	ret = -KVM_ENOSYS;

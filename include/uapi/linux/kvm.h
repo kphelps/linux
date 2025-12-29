@@ -1602,6 +1602,8 @@ struct kvm_s390_ucas_mapping {
 #define KVM_MAP_GPA_BATCH         _IOW(KVMIO, 0xd3, struct kvm_gpa_batch_mapping)
 #define KVM_REGISTER_USERMMU_REGION   _IOWR(KVMIO, 0xd4, struct kvm_usermmu_region)
 #define KVM_UNREGISTER_USERMMU_REGION _IOW(KVMIO, 0xd9, struct kvm_usermmu_region)
+/* Flush all guest translations (INVEPT + INVVPID) for USERMMU slots. */
+#define KVM_FLUSH_GPA_TLBS        _IO(KVMIO, 0xda)
 #define KVM_SET_TSC_CONFIG        _IOW(KVMIO, 0xd5, struct kvm_tsc_config)
 #define KVM_GET_TSC_CONFIG        _IOR(KVMIO, 0xd6, struct kvm_tsc_config)
 #define KVM_SET_TSC_MODE          _IOW(KVMIO, 0xd7, struct kvm_tsc_mode_data)
