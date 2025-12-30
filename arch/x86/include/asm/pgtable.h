@@ -23,6 +23,7 @@
 #include <asm/coco.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
+#include <asm/gemvisor_trace.h>
 
 extern pgd_t early_top_pgt[PTRS_PER_PGD];
 bool __init __early_make_pgtable(unsigned long address, pmdval_t pmd);
@@ -1229,6 +1230,7 @@ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
 			      pmd_t *pmdp, pmd_t pmd)
 {
 	page_table_check_pmd_set(mm, pmdp, pmd);
+	gem_trace_pte_modify(addr, pmd_val(*pmdp), pmd_val(pmd));
 	set_pmd(pmdp, pmd);
 }
 

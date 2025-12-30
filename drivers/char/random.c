@@ -1365,17 +1365,30 @@ static void __cold try_to_generate_entropy(void)
 
 static inline long gemvisor_rng_read(void *buf, size_t len)
 {
-	size_t dwords = len >> 2;
-	size_t tail = len & 0x3;
 	u8 *cursor = buf;
+	size_t remaining = len;
 
 	if (len == 0)
 		return 0;
 
-	if (dwords)
-		insl(GEMVISOR_RNG_PORT, cursor, dwords);
-	if (tail)
-		insb(GEMVISOR_RNG_PORT, cursor + (dwords << 2), tail);
+	/*
+	 * Avoid ins{b,l} string I/O here: KVM emulates REP INS by writing
+	 * directly into guest memory, which bypasses USERMMU CoW/dirty
+	 * tracking and can corrupt snapshot determinism. Use scalar inl/inb
+	 * plus explicit stores instead so writes trap normally.
+	 */
+	while (remaining >= sizeof(u32)) {
+		u32 value = inl(GEMVISOR_RNG_PORT);
+
+		memcpy(cursor, &value, sizeof(value));
+		cursor += sizeof(value);
+		remaining -= sizeof(value);
+	}
+
+	while (remaining) {
+		*cursor++ = inb(GEMVISOR_RNG_PORT);
+		remaining--;
+	}
 
 	return (long)len;
 }
