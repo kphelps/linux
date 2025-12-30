@@ -53,6 +53,7 @@
 #include <linux/khugepaged.h>
 #include <linux/delayacct.h>
 #include <asm/div64.h>
+#include <asm/sections.h>
 #include <asm/gemvisor_alloc_bitmap.h>
 #include "internal.h"
 #include "shuffle.h"
@@ -1079,6 +1080,35 @@ static void kernel_init_pages(struct page *page, int numpages)
 	kasan_enable_current();
 }
 
+#ifdef CONFIG_GEMVISOR_DETERMINISM
+static __always_inline void gemvisor_check_free_kernel_text(struct page *page,
+							    unsigned int order)
+{
+	unsigned long phys;
+	unsigned long text_start;
+	unsigned long text_end;
+
+	if (!debug_pagealloc_enabled())
+		return;
+
+	phys = page_to_phys(page);
+	text_start = __pa_symbol(_stext);
+	text_end = __pa_symbol(_etext);
+
+	if (phys >= text_start && phys < text_end) {
+		pr_emerg(
+			"gemvisor: freeing kernel text page phys=%#lx pfn=%lu order=%u\n",
+			phys, page_to_pfn(page), order);
+		dump_stack();
+	}
+}
+#else
+static __always_inline void gemvisor_check_free_kernel_text(struct page *page,
+							    unsigned int order)
+{
+}
+#endif
+
 static __always_inline bool free_pages_prepare(struct page *page,
 			unsigned int order, fpi_t fpi_flags)
 {
@@ -1087,6 +1117,7 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	bool init = want_init_on_free();
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
+	gemvisor_check_free_kernel_text(page, order);
 
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
